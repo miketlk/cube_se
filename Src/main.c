@@ -169,7 +169,7 @@ static void keycard_select(){
   HAL_SMARTCARD_Transmit(&hsc2, cmd_select, 5, 100);
 
   /* Flush the SC_USART DR */
-  __HAL_SMARTCARD_FLUSH_DRREGISTER(&hsc2);
+  // __HAL_SMARTCARD_FLUSH_DRREGISTER(&hsc2);
 
   /* Start the receive IT process: to receive the command answer from the card */
   // HAL_SMARTCARD_Receive_IT(&hsc2, (uint8_t *)&answer[0], 1);
