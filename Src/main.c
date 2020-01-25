@@ -142,9 +142,8 @@ static void smartcard_reset(){
   smartcard_read();
 }
 static void smartcard_poweroff(){
-  HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_SET);
   HAL_Delay(200);
-  HAL_GPIO_WritePin(SC_POWER_PORT, SC_POWER_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SC_POWER_PORT, SC_POWER_PIN, GPIO_PIN_SET);
 }
 // keycard-specific commands
 static void keycard_select(){
@@ -185,7 +184,45 @@ static void keycard_select(){
   // smartcard_read();
 }
 
+static void smartcard_submit_default_issuer_code() {
+  uint8_t cmd_submit_code[] = { 0x80, 0x20, 0x07, 0x00, 0x08, 0x41, 0x43, 0x4F, 
+                                0x53, 0x54, 0x45, 0x53, 0x54 };
+  uint8_t answer[40] = {0x00};
+
+  HAL_SMARTCARD_Transmit(&hsc2, cmd_submit_code, sizeof(cmd_submit_code), 100);
+
+  smartcard_read();
+  HAL_Delay(100);
+  char msg[20] = "";
+  sprintf(msg, "recv: %02x, %02x\r\n", answer[0], HAL_SMARTCARD_GetState(&hsc2));
+  print_log(msg);
+}
+
+static void smartcard_start_session() {
+  uint8_t cmd_start_session[] = { 0x80, 0x84, 0x00, 0x00, 0x08 };
+  uint8_t answer[40] = {0x00};
+
+  HAL_SMARTCARD_Transmit(&hsc2, cmd_start_session, sizeof(cmd_start_session), 100);
+
+  smartcard_read();
+  HAL_Delay(100);
+  char msg[20] = "";
+  sprintf(msg, "recv: %02x, %02x\r\n", answer[0], HAL_SMARTCARD_GetState(&hsc2));
+  print_log(msg);
+}
+
 /* USER CODE END 0 */
+
+static void print_help() {
+  print_log("\r\nSmartcard playground:\r\n");
+  print_log("  `p` - apply power to smart card, should return ATR\r\n");
+  print_log("  `r` - reboot startcard, should return ATR\r\n");
+  print_log("  `s` - send hardcoded command { 0x00, 0x84, 0x00, 0x00, 0x00 }\r\n");
+  print_log("  `q` - remove power from smart card\r\n");
+  print_log("  `i` - submit default issuer code `ACOSTEST`\r\n");
+  print_log("  `e` - send START SESSION command { 0x80, 0x84, 0x00, 0x00, 0x08 }\r\n");  
+  print_log("  `1`, `2`, `3` - toggle LED 1/2/3\r\n\r\n"); 
+}
 
 /**
   * @brief  The application entry point.
@@ -233,6 +270,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   /* USER CODE END 2 */
 
+  print_help();
+
   while (1)
   {
     /* USER CODE END WHILE */
@@ -246,6 +285,7 @@ int main(void)
         if(card_present){
           print_log("Powering smartcard\r\n");
           smartcard_poweron();
+          print_help();
         }else{
           print_err("Smartcard is not present\r\n");
         }
@@ -274,6 +314,22 @@ int main(void)
           print_err("Smartcard is not present\r\n");
         }
         break;
+      case 'i':
+        if(card_present){
+          print_log("Submitting issuer code `ACOSTEST`\r\n");
+          smartcard_submit_default_issuer_code();
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;
+      case 'e':
+        if(card_present){
+          print_log("Starting session\r\n");
+          smartcard_start_session();
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;        
       case '1':
         HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
         break;
@@ -822,7 +878,7 @@ static void MX_USART2_SMARTCARD_Init(void)
   hsc2.Init.Mode = SMARTCARD_MODE_TX_RX;
   // hsc2.Init.GuardTime = 0;
   /* BEGIN from example */
-  hsc2.Init.BaudRate = 10080;// 10080;  /* Starting baudrate = 3,5MHz / 372etu */
+  hsc2.Init.BaudRate = 10081; // 10080;// 10080;  /* Starting baudrate = 3,5MHz / 372etu */
   hsc2.Init.CLKPolarity = SMARTCARD_POLARITY_LOW;
   hsc2.Init.CLKPhase = SMARTCARD_PHASE_1EDGE; // SMARTCARD_PHASE_1EDGE;
   hsc2.Init.CLKLastBit = SMARTCARD_LASTBIT_ENABLE; // SMARTCARD_LASTBIT_ENABLE;  
