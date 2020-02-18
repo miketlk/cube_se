@@ -184,6 +184,58 @@ static void keycard_select(){
   // smartcard_read();
 }
 
+static void smartcard_select_teapot() {
+  uint8_t cmd_submit_code[] = { 0x00, 0xA4, 0x04, 0x00, 0x06 };
+  uint8_t answer[40] = {0x00};
+
+  HAL_SMARTCARD_Transmit(&hsc2, cmd_submit_code, sizeof(cmd_submit_code), 100);
+
+  smartcard_read();
+  HAL_Delay(100);
+  char msg[20] = "";
+  sprintf(msg, "recv: %02x, %02x\r\n", answer[0], HAL_SMARTCARD_GetState(&hsc2));
+  print_log(msg);
+}
+
+static void smartcard_select_teapot2() {
+  uint8_t cmd_submit_code[] = { 0xB0, 0x0B, 0x51, 0x11, 0xCA, 0x01 };
+  uint8_t answer[40] = {0x00};
+
+  HAL_SMARTCARD_Transmit(&hsc2, cmd_submit_code, sizeof(cmd_submit_code), 100);
+
+  smartcard_read();
+  HAL_Delay(100);
+  char msg[20] = "";
+  sprintf(msg, "recv: %02x, %02x\r\n", answer[0], HAL_SMARTCARD_GetState(&hsc2));
+  print_log(msg);
+}
+
+static void smartcard_get_teapot_secret() {
+  uint8_t cmd_submit_code[] = { 0xB0, 0xA1, 0x00, 0x00, 0x00 };
+  uint8_t answer[40] = {0x00};
+
+  HAL_SMARTCARD_Transmit(&hsc2, cmd_submit_code, sizeof(cmd_submit_code), 100);
+
+  smartcard_read();
+  HAL_Delay(100);
+  char msg[20] = "";
+  sprintf(msg, "recv: %02x, %02x\r\n", answer[0], HAL_SMARTCARD_GetState(&hsc2));
+  print_log(msg);
+}
+
+static void smartcard_get_teapot_secret2() {
+  uint8_t cmd_submit_code[] = { 0x00, 0xC0, 0x00, 0x00, 0x28 };
+  uint8_t answer[40] = {0x00};
+
+  HAL_SMARTCARD_Transmit(&hsc2, cmd_submit_code, sizeof(cmd_submit_code), 100);
+
+  smartcard_read();
+  HAL_Delay(100);
+  char msg[20] = "";
+  sprintf(msg, "recv: %02x, %02x\r\n", answer[0], HAL_SMARTCARD_GetState(&hsc2));
+  print_log(msg);
+}
+
 static void smartcard_submit_default_issuer_code() {
   uint8_t cmd_submit_code[] = { 0x80, 0x20, 0x07, 0x00, 0x08, 0x41, 0x43, 0x4F, 
                                 0x53, 0x54, 0x45, 0x53, 0x54 };
@@ -222,6 +274,8 @@ static void print_help() {
   print_log("  `i` - submit default issuer code `ACOSTEST`\r\n");
   print_log("  `e` - send START SESSION command { 0x80, 0x84, 0x00, 0x00, 0x08 }\r\n");  
   print_log("  `1`, `2`, `3` - toggle LED 1/2/3\r\n\r\n"); 
+  print_log("  `7`, `8` - start and end selecting teapot applet \r\n\r\n"); 
+  print_log("  `9`, `0` - start and end getting teapot secret \r\n\r\n"); 
 }
 
 /**
@@ -330,6 +384,38 @@ int main(void)
           print_err("Smartcard is not present\r\n");
         }
         break;        
+      case '7':
+        if(card_present){
+          print_log("Select Teapot start\r\n");
+          smartcard_select_teapot();
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;
+      case '8':
+        if(card_present){
+          print_log("Select Teapot continue\r\n");
+          smartcard_select_teapot2();
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;
+      case '9':
+        if(card_present){
+          print_log("Get Teapot secret\r\n");
+          smartcard_get_teapot_secret();
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;
+      case '0':
+        if(card_present){
+          print_log("Get Teapot secret\r\n");
+          smartcard_get_teapot_secret2();
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;
       case '1':
         HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
         break;
