@@ -263,6 +263,123 @@ static void smartcard_start_session() {
   print_log(msg);
 }
 
+static uint8_t smartcard_t1_transmit_apdu(const uint8_t *apdu, int apdu_length,
+  uint8_t *p_seq_number) {
+  uint8_t buf[254+4];
+  uint8_t *p = buf;
+  uint8_t lrc = 0;
+
+  if(apdu_length < 1 || apdu_length + 4 > sizeof(buf)) return 0;
+
+  *(p++) = 0x00; // NAD
+  *(p++) = *p_seq_number; // PCB
+  *p_seq_number ^= 0x40;
+  *(p++) = apdu_length; // LEN
+  
+  memcpy(buf + 3, apdu, apdu_length);
+  p += apdu_length;
+
+  for(int i = 0; i < p - buf; i++) {
+    lrc ^= buf[i];
+  }
+  *(p++) = lrc; // EDC (LRC only supported)
+
+  HAL_SMARTCARD_Transmit(&hsc2, buf, p - buf, 100);
+  return 1;
+}
+
+static void smartcard_t1_read(){
+  uint8_t buf[100] = { 0 };
+  char msg[205] = "";
+  HAL_StatusTypeDef status = HAL_OK;
+  size_t cur = 0;
+  uint8_t lrc = 0;
+
+  while((status == HAL_OK) && (cur < 100)){
+    status = HAL_SMARTCARD_Receive(&hsc2, buf+cur, 1, 100);
+    if(status == HAL_OK){
+      cur++;
+    }
+  }
+  for(int i=0; i<cur; i++){
+    sprintf(msg+strlen(msg), "%02x", buf[i]);
+  }
+
+  // Try to decode T=1
+  if(cur >= 4) {
+    // HACK: Skipping extra 0x00 byte, problem need to be investigated!
+    memmove(buf, buf + 1, cur - 1);
+    cur--;
+    // End of hack
+
+    for(int i = 0; i < cur - 1; i++) {
+      lrc ^= buf[i];
+    }
+    if(lrc == buf[cur - 1] && buf[0] == 0) {
+      int len = 0;
+      sprintf(msg+strlen(msg), "T=1 ");
+      switch(buf[1] & 0xC0) {
+        case 0x80:
+          sprintf(msg+strlen(msg), "R-block ");
+          break;
+
+        case 0xC0:
+          sprintf(msg+strlen(msg), "S-block ");
+          break;
+
+        default:
+          sprintf(msg+strlen(msg), "I-block, data: ");
+          len = buf[2];
+          if(len == cur - 4) {
+            for(int i = 0; i < len; i++) {
+              sprintf(msg+strlen(msg), "%02x ", buf[i + 3]);
+            }
+          }
+          break;          
+      }
+    }
+  }
+
+  sprintf(msg+strlen(msg), "\r\n");
+  print_log(msg);
+}
+
+static void smartcard_select_teapot_t1(uint8_t *p_seq_number) {
+  uint8_t apdu[] = { 0x00, 0xA4, 0x04, 0x00, 0x06, 0xB0, 0x0B, 0x51, 0x11, 0xCA, 0x01 };
+
+  smartcard_t1_transmit_apdu(apdu, sizeof(apdu), p_seq_number);
+
+  smartcard_t1_read();
+  HAL_Delay(100);
+}
+
+static void smartcard_teapot_store_data_t1(uint8_t *p_seq_number, uint8_t *p_byte_value) {
+  uint8_t apdu[] = { 0xB0, 0xA2, 0x00, 0x00, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+  char msg[205] = "";
+
+  sprintf(msg, "Data: ");
+  for(int i = 5; i < sizeof(apdu); i++) {
+    apdu[i] = (*p_byte_value)++;
+    sprintf(msg+strlen(msg), "%02x ", apdu[i]);
+  }
+  sprintf(msg+strlen(msg), "\r\n");
+  print_log(msg);
+
+  smartcard_t1_transmit_apdu(apdu, sizeof(apdu), p_seq_number);
+
+  smartcard_t1_read();
+  HAL_Delay(100);
+}
+
+static void smartcard_teapot_get_data_t1(uint8_t *p_seq_number) {
+  uint8_t apdu[] = { 0xB0, 0xA1, 0x00, 0x00, 0 };
+
+  smartcard_t1_transmit_apdu(apdu, sizeof(apdu), p_seq_number);
+
+  smartcard_t1_read();
+  HAL_Delay(100);
+}
+
 /* USER CODE END 0 */
 
 static void print_help() {
@@ -273,9 +390,12 @@ static void print_help() {
   print_log("  `q` - remove power from smart card\r\n");
   print_log("  `i` - submit default issuer code `ACOSTEST`\r\n");
   print_log("  `e` - send START SESSION command { 0x80, 0x84, 0x00, 0x00, 0x08 }\r\n");  
-  print_log("  `1`, `2`, `3` - toggle LED 1/2/3\r\n\r\n"); 
-  print_log("  `7`, `8` - start and end selecting teapot applet \r\n\r\n"); 
-  print_log("  `9`, `0` - start and end getting teapot secret \r\n\r\n"); 
+  print_log("  `1`, `2`, `3` - toggle LED 1/2/3\r\n"); 
+  print_log("  `7`, `8` - start and end selecting Teapot applet \r\n"); 
+  print_log("  `9`, `0` - start and end getting Teapot secret \r\n"); 
+  print_log("  `z` - select Teapot applet using T=1 \r\n");
+  print_log("  `x` - store 16 sequential bytes in Teapot applet, T=1\r\n");
+  print_log("  `c` - read data from Teapot applet, T=1\r\n");
 }
 
 /**
@@ -284,6 +404,9 @@ static void print_help() {
   */
 int main(void)
 {
+    uint8_t t1_seq_number = 0;
+    uint8_t byte_value = 0;
+
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -326,6 +449,7 @@ int main(void)
 
   print_help();
 
+
   while (1)
   {
     /* USER CODE END WHILE */
@@ -339,6 +463,7 @@ int main(void)
         if(card_present){
           print_log("Powering smartcard\r\n");
           smartcard_poweron();
+          t1_seq_number = 0;
           print_help();
         }else{
           print_err("Smartcard is not present\r\n");
@@ -348,6 +473,7 @@ int main(void)
         if(card_present){
           print_log("Resetting smartcard\r\n");
           smartcard_reset();
+          t1_seq_number = 0;
         }else{
           print_err("Smartcard is not present\r\n");
         }
@@ -416,6 +542,33 @@ int main(void)
           print_err("Smartcard is not present\r\n");
         }
         break;
+      case 'z':
+      case 'Z':      
+        if(card_present){
+          print_log("Select Teapot T=1\r\n");
+          smartcard_select_teapot_t1(&t1_seq_number);
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;
+      case 'x':
+      case 'X':      
+        if(card_present){
+          print_log("Store data in Teapot\r\n");
+          smartcard_teapot_store_data_t1(&t1_seq_number, &byte_value);
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break; 
+      case 'c':
+      case 'C':      
+        if(card_present){
+          print_log("Get data from Teapot\r\n");
+          smartcard_teapot_get_data_t1(&t1_seq_number);
+        } else {
+          print_err("Smartcard is not present\r\n");
+        }
+        break;                         
       case '1':
         HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
         break;
