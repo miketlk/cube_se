@@ -4,7 +4,6 @@
  * @author Mike Tolkachev <mstolkachev@gmail.com>
  */
 
-#include <string.h>
 #include <limits.h>
 #define FIFO_BUF_IMPLEMENT
 #include "t1_protocol.h"
@@ -17,6 +16,16 @@
 #define DEF_SLEEP_TIME_MS               50
 /// Maximal length of EDC code in bytes
 #define MAX_EDC_LEN                     2
+/// Minimal number of bytes for a valid ATR
+#define ATR_MIN_BYTES                   2
+/// Bit within T0 or TD bytes indicating that TA is present
+#define TA_BIT                          (1)
+/// Bit within T0 or TD bytes indicating that TB is present
+#define TB_BIT                          (1 << 1)
+/// Bit within T0 or TD bytes indicating that TC is present
+#define TC_BIT                          (1 << 2)
+/// Bit within T0 or TD bytes indicating that TD is present
+#define TD_BIT                          (1 << 3)
 
 /// Byte offsets and size of T=1 prologue
 typedef enum {
@@ -26,15 +35,29 @@ typedef enum {
   prologue_size     ///< Size of prologue
 } prologue_offsets_t;
 
-/// CRC table
+/// One entry in range check table for configuration
+typedef struct {
+  int32_t min;  ///< Allowed minimal value
+  int32_t max;  ///< Allowed maximal value
+} config_range_entry_t;
+
+/// CRC table for (x^16 + x^12 + x^5 + 1) polynomial
 static const uint16_t crc_tbl[256];
 
 /// Default configuration
-static const uint32_t def_config[t1_config_size] = {
-  [t1_cfg_tm_interbyte] = 10,
-  [t1_cfg_atr_timeout] = 1000, // TODO: Trigger at initialization and reset
-  [t1_cfg_tm_response] = 500,
+static const int32_t def_config[t1_config_size] = {
+  [t1_cfg_tm_interbyte_ms] = 10,
+  [t1_cfg_tm_atr_ms]      = 1000,
+  [t1_cfg_tm_response_ms] = 500,
   [t1_cfg_use_crc] = 0
+};
+
+/// Configuration range check table
+static const config_range_entry_t config_range[t1_config_size] = {
+  [t1_cfg_tm_interbyte_ms] = { 1, T1_MAX_TIMEOUT_MS },
+  [t1_cfg_tm_atr_ms]       = { 1, T1_MAX_TIMEOUT_MS },
+  [t1_cfg_tm_response_ms]  = { 1, T1_MAX_TIMEOUT_MS },
+  [t1_cfg_use_crc]         = { 0, 1 }
 };
 
 /**
@@ -45,6 +68,25 @@ static const uint32_t def_config[t1_config_size] = {
  */
 static inline size_t min_size_t(size_t a, size_t b) {
     return a < b ? a : b;
+}
+
+/**
+ * Returns minimal of two uint32_t operands
+ * @param a  operand A
+ * @param b  operand B
+ * @return   minimal of A and B
+ */
+static inline uint32_t min_u32(uint32_t a, uint32_t b) {
+    return a < b ? a : b;
+}
+
+/**
+ * Checks is given event code corresponds to error event
+ * @param ev_code  event code
+ * @return         true if given event is an error event
+ */
+static inline bool is_error_event(t1_event_t ev_code) {
+  return ev_code >= t1_ev_err_internal;
 }
 
 /**
@@ -103,7 +145,7 @@ static inline size_t calc_crc(const uint8_t* src, size_t src_len, uint8_t* dst,
  * @param dst_len  size of destination buffer
  * @return         number of bytes written to destination buffer
  */
-static size_t calc_edc(t1_inst_t *inst, const uint8_t* src, size_t src_len,
+static size_t calc_edc(t1_inst_t* inst, const uint8_t* src, size_t src_len,
                        uint8_t* dst, size_t dst_len) {
   return inst->config[t1_cfg_use_crc] ?
     calc_crc(src, src_len, dst, dst_len) :
@@ -115,68 +157,305 @@ static size_t calc_edc(t1_inst_t *inst, const uint8_t* src, size_t src_len,
  * @param inst      protocol instance
  * @param wait_atr  if true sets protocol instance into "waiting for ATR" state
  */
-static void t1_reset_internal(t1_inst_t *inst, bool wait_atr) {
+static void t1_reset_internal(t1_inst_t* inst, bool wait_atr) {
+  inst->fsm_state = wait_atr ? t1_st_wait_atr : t1_st_idle;
   fifo_clear(&inst->tx_fifo);
   inst->tx_fifo_nblock = 0;
   inst->seq_number = 0;
-  inst->fsm_state = wait_atr ? t1_st_wait_atr : t1_st_idle;
+  inst->rx_buf_idx = 0;
+  inst->expected_bytes = wait_atr ? ATR_MIN_BYTES : 0;
+  inst->tmr_interbyte_timeout = 0;
+  inst->tmr_atr_timeout = wait_atr ? inst->config[t1_cfg_tm_atr_ms] : 0;
+  inst->tmr_response_timeout = 0;
 }
 
-bool t1_init(t1_inst_t *inst, t1_cb_serial_out_t cb_serial_out,
+bool t1_init(t1_inst_t* inst, t1_cb_serial_out_t cb_serial_out,
              t1_cb_handle_apdu_t cb_handle_apdu,
              t1_cb_handle_event_t cb_handle_event, void* p_user_prm) {
   if(inst && cb_serial_out && cb_handle_apdu && cb_handle_event) {
-    memset(inst, 0, sizeof(t1_inst_t));
     inst->cb_serial_out = cb_serial_out;
     inst->cb_handle_apdu = cb_handle_apdu;
     inst->cb_handle_event = cb_handle_event;
     inst->p_user_prm = p_user_prm;
-    memcpy(inst->config, def_config, sizeof(inst->config));
+    for(int i = 0; i < t1_config_size; i++) {
+      inst->config[i] = def_config[i];
+    }
     fifo_init(&inst->tx_fifo, inst->tx_fifo_buf, T1_TX_FIFO_SIZE);
-    t1_reset_internal(inst);
+    t1_reset_internal(inst, true);
     return true;
   }
   return false;
 }
 
-bool t1_set_config(t1_inst_t *inst, t1_config_prm_id_t prm_id, uint32_t value) {
+bool t1_set_config(t1_inst_t* inst, t1_config_prm_id_t prm_id, int32_t value) {
   if(inst && prm_id >= 0 &&  prm_id < t1_config_size) {
-    inst->config[prm_id] = value;
-    return true;
+    // Check that range is defined and value is within allowed range
+    if((config_range[prm_id].min || config_range[prm_id].max) &&
+       value >= config_range[prm_id].min && value <= config_range[prm_id].max) {
+      inst->config[prm_id] = value;
+      return true;
+    }
   }
   return false;
 }
 
-uint32_t t1_get_config(t1_inst_t *inst, t1_config_prm_id_t prm_id) {
+int32_t t1_get_config(t1_inst_t* inst, t1_config_prm_id_t prm_id) {
   if(inst && prm_id >= 0 &&  prm_id < t1_config_size) {
     return inst->config[prm_id];
   }
   return 0;
 }
 
-void t1_reset(t1_inst_t *inst, bool wait_atr) {
+void t1_reset(t1_inst_t* inst, bool wait_atr) {
   if(inst) {
     t1_reset_internal(inst, wait_atr);
     inst->cb_handle_event(t1_ev_reset, NULL, inst->p_user_prm);
   }
 }
 
-void t1_timer_task(t1_inst_t *inst, uint32_t elapsed_ms) {
-  if(inst && inst->fsm_state != t1_st_error) {
-    // TODO: Implement
+/**
+ * Decreases timer counter and checks if it is elapsed
+ *
+ * This function also ensures that it is called at least twice before indicating
+ * that timer is elapsed. It is done as protection measure against abnormally
+ * quick timeout event in case timer task is called right after the timer
+ * variable is initialized. As side effect, this function supports timeouts not
+ * longer than 0x7FFFFFFF.
+ * @param p_timer     pointer to timer variable
+ * @param elapsed_ms  time in milliseconds passed since previous call
+ * @return            true is timer is elapsed
+ */
+static bool timer_elapsed(uint32_t *p_timer, uint32_t elapsed_ms) {
+  if(*p_timer) {
+    uint32_t time = *p_timer & 0x7FFFFFFFUL;
+    if(!(time -= min_u32(elapsed_ms, time))) {
+      if(*p_timer & 0x80000000UL) { // Not first call?
+        *p_timer = 0;
+        return true;
+      }
+    }
+    // Set higher bit to check for non-first call later
+    *p_timer = time | 0x80000000UL;
+  }
+  return false;
+}
+
+/**
+ * Handles protocol events
+ *
+ * This function handles protocol events by notifying host. In case of error
+ * event it also transfers FSM into error state.
+ * IMPORTANT: This function must be called just before returning from any API
+ * functions to allow calling other API functions from user handler.
+ * @param inst     protocol instance
+ * @param ev_code  event code
+ * @param ev_prm   event parameter depending on event code, typically NULL
+ */
+static void handle_event(t1_inst_t* inst, t1_event_t ev_code,
+                         const void* ev_prm) {
+  if(ev_code != t1_ev_none) {
+    if(is_error_event(ev_code)) {
+      inst->fsm_state = t1_st_error;
+    }
+    inst->cb_handle_event(ev_code, ev_prm, inst->p_user_prm);
   }
 }
 
-uint32_t t1_can_sleep_ms(t1_inst_t *inst) {
-  if(inst && inst->fsm_state == t1_st_wait_response) {
-    return DEF_SLEEP_TIME_MS;
+/**
+ * Returns number of interface bytes from given indicator Y
+ * @param y  indicator, Y
+ * @return   number of interface bytes
+ */
+static inline size_t atr_ibyte_num(uint8_t y) {
+  return ((y >> 3) & 1) + ((y >> 2) & 1) + ((y >> 1) & 1) + (y & 1);
+}
+
+static inline void iface_init(t1_iface_t* p_iface, uint8_t prot_id) {
+  p_iface->prot_id = prot_id;
+  p_iface->ta = -1;
+  p_iface->tb = -1;
+  p_iface->tc = -1;
+}
+
+static bool parse_atr(t1_inst_t* inst, t1_ev_prm_atr_t* p_atr) {
+  size_t exp_len = ATR_MIN_BYTES;
+  size_t atr_len = inst->rx_buf_idx;
+  const uint8_t* p_byte = inst->rx_buf;
+  uint8_t y = 0;
+  uint8_t tck = 0;
+  bool tck_present = false;
+
+  p_atr->atr = inst->rx_buf;
+  p_atr->atr_len = atr_len;
+  p_atr->iface_num = 0;
+  p_atr->hist_bytes = NULL;
+  p_atr->hist_nbytes = 0;
+
+  size_t n;
+  for(n = 0; n < atr_len && exp_len <= atr_len && n < exp_len; n++, p_byte++) {
+    if(n == 0) { // TS, initial character
+      // Just skip
+    } else if(n == 1) { // T0, format byte
+      exp_len += p_atr->hist_nbytes = *p_byte & 0x0F;
+      y = *p_byte >> 4;
+      if(y) {
+          iface_init(&p_atr->ifaces[0], T1_ATR_GLOBALS);
+          p_atr->iface_num++;
+          exp_len += atr_ibyte_num(y);
+      }
+    } else {
+      if(y & TA_BIT) {
+        p_atr->ifaces[p_atr->iface_num - 1].ta = *p_byte;
+        y ^= TA_BIT;
+      } else if(y & TB_BIT) {
+        p_atr->ifaces[p_atr->iface_num - 1].tb = *p_byte;
+        y ^= TB_BIT;
+      } else if(y & TC_BIT) {
+        p_atr->ifaces[p_atr->iface_num - 1].tc = *p_byte;
+        y ^= TC_BIT;
+      } else if(y & TD_BIT) {
+        y = *p_byte >> 4;
+        if(y) {
+          if(p_atr->iface_num + 1 <= T1_ATR_MAX_IFACES) {
+            uint8_t prot_id = *p_byte & 0x0F;
+            iface_init(&p_atr->ifaces[p_atr->iface_num++], prot_id);
+            exp_len += atr_ibyte_num(y);
+            if(prot_id) {
+              tck_present = true;
+              exp_len++;
+            }
+          }
+        }
+      } else if(p_atr->hist_bytes == NULL) { // Historical bytes
+        p_atr->hist_bytes = p_byte;
+      }
+    }
+
+    if(n > 0) {
+      tck ^= *p_byte;
+    }
+  }
+
+  if(exp_len <= atr_len && (!tck_present || tck == 0) ) {
+    return true;
+  }
+
+  return false;
+}
+
+static void handle_atr(t1_inst_t* inst, t1_ev_prm_atr_t* p_atr) {
+
+}
+
+void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms) {
+  if(inst && inst->fsm_state != t1_st_error) {
+    t1_event_t ev_code = t1_ev_none;
+    t1_ev_prm_atr_t ev_prm_atr;
+    void* ev_prm = NULL;
+
+    // Process all timers
+    if(timer_elapsed(&inst->tmr_interbyte_timeout, elapsed_ms)) {
+      if(inst->fsm_state == t1_st_wait_atr) {
+        if(parse_atr(inst, &ev_prm_atr)) {
+          handle_atr(inst, &ev_prm_atr);
+          ev_code = t1_ev_atr_received;
+          ev_prm = &ev_prm_atr;
+          inst->fsm_state = t1_st_idle;
+        } else {
+          ev_code = t1_ev_err_bad_atr;
+          inst->fsm_state = t1_st_error;
+        }
+      } else if (inst->fsm_state == t1_st_wait_response) {
+        // TODO: handle byte timeout properly
+      }
+      inst->rx_buf_idx = 0;
+    }
+    if(timer_elapsed(&inst->tmr_atr_timeout, elapsed_ms)) {
+      ev_code = t1_ev_err_atr_timeout;
+    }
+    if(timer_elapsed(&inst->tmr_response_timeout, elapsed_ms)) {
+      // TODO: Implement
+    }
+
+    handle_event(inst, ev_code, ev_prm); // Just before returning
+  }
+}
+
+uint32_t t1_can_sleep_ms(t1_inst_t* inst) {
+  if(inst) {
+    if(inst->tmr_interbyte_timeout ||
+       inst->tmr_atr_timeout ||
+       inst->tmr_response_timeout) {
+      return DEF_SLEEP_TIME_MS;
+    }
   }
   return ULONG_MAX;
 }
 
-void t1_serial_in(t1_inst_t *inst, const uint8_t* buf, size_t len) {
-  if(inst && buf && len && inst->fsm_state != t1_st_error) {
+/**
+ * Handles ATR data
+ * @param inst       protocol instance
+ * @param buf        buffer holding received bytes
+ * @param len        number of bytes received
+ * @param ev_prm     pointer to variable receiving event parameter
+ * @return           event code in case of event or t1_ev_none
+ */
+static t1_event_t handle_atr_data(t1_inst_t* inst, const uint8_t* buf,
+                                  size_t len, void** ev_prm) {
+
+  if(inst->rx_buf_idx + len > T1_RX_BUF_SIZE) {
+    return t1_ev_err_bad_atr;
+  }
+
+  while(len--) {
+    inst->rx_buf[inst->rx_buf_idx++] = *buf++;
+  }
+  inst->tmr_atr_timeout = 0;
+  inst->tmr_interbyte_timeout = inst->config[t1_cfg_tm_interbyte_ms];
+  // ATR will be parsed by timer, when smart card stops transmitting bytes
+
+  return t1_ev_none;
+}
+
+/**
+ * Handles T=1 data
+ * @param inst       protocol instance
+ * @param buf        buffer holding received bytes
+ * @param len        number of bytes received
+ * @param ev_prm     pointer to variable receiving event parameter
+ * @return           event code in case of event or t1_ev_none
+ */
+static t1_event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf,
+                                 size_t len, void** ev_prm) {
+  if(inst->rx_buf_idx) {
     // TODO: Implement
+    inst->rx_buf_idx = 0;
+  }
+
+  return t1_ev_none;
+}
+
+void t1_serial_in(t1_inst_t* inst, const uint8_t* buf, size_t len) {
+  if(inst && buf && len && inst->fsm_state != t1_st_error) {
+    t1_event_t ev_code = t1_ev_none;
+    void* ev_prm = NULL;
+
+    // Handle received data
+    switch(inst->fsm_state) {
+      case t1_st_wait_atr:
+        ev_code = handle_atr_data(inst, buf, len, &ev_prm);
+        break;
+
+      case t1_st_wait_response:
+        ev_code = handle_t1_data(inst, buf, len, &ev_prm);
+        break;
+
+      default:
+        inst->rx_buf_idx = 0;
+        break;
+    }
+
+    handle_event(inst, ev_code, ev_prm);  // Just before returning
   }
 }
 
@@ -188,7 +467,7 @@ void t1_serial_in(t1_inst_t *inst, const uint8_t* buf, size_t len) {
  * @param apdu  buffer containing APDU
  * @param len   length of APDU in bytes
  */
-static bool code_iblock(t1_inst_t *inst, const uint8_t* apdu, size_t len)
+static bool code_iblock(t1_inst_t* inst, const uint8_t* apdu, size_t len)
 {
   if(len <= T1_MAX_APDU_SIZE) {
     size_t block_size = 0;
@@ -229,12 +508,11 @@ static bool code_iblock(t1_inst_t *inst, const uint8_t* apdu, size_t len)
  *                          out error
  * @return      true - OK, false - callback reported failure
  */
-static bool output_block(t1_inst_t *inst, bool *p_err_serial_out) {
+static bool output_block(t1_inst_t* inst, bool *p_err_serial_out) {
   if(fifo_nused(&inst->tx_fifo) > 2) {
     uint8_t buf[32];
-    size_t block_size, read_idx = fifo_get_read_idx(&inst->tx_fifo);
-
-    block_size = (size_t)fifo_read(&inst->tx_fifo, &read_idx) << 8;
+    size_t read_idx = fifo_get_read_idx(&inst->tx_fifo);
+    size_t block_size = (size_t)fifo_read(&inst->tx_fifo, &read_idx) << 8;
     block_size |= fifo_read(&inst->tx_fifo, &read_idx);
 
     while(block_size) {
@@ -254,18 +532,17 @@ static bool output_block(t1_inst_t *inst, bool *p_err_serial_out) {
  * Removes last block from FIFO buffer
  * @param inst  protocol instance
  */
-static void remove_block(t1_inst_t *inst) {
+static void remove_block(t1_inst_t* inst) {
   if(fifo_nused(&inst->tx_fifo) > 2) {
-    size_t block_size, read_idx = fifo_get_read_idx(&inst->tx_fifo);
-
-    block_size = (size_t)fifo_read(&inst->tx_fifo, &read_idx) << 8;
+    size_t read_idx = fifo_get_read_idx(&inst->tx_fifo);
+    size_t block_size = (size_t)fifo_read(&inst->tx_fifo, &read_idx) << 8;
     block_size |= fifo_read(&inst->tx_fifo, &read_idx);
     fifo_remove(&inst->tx_fifo, block_size);
     inst->tx_fifo_nblock--;
   }
 }
 
-bool t1_transmit_apdu(t1_inst_t *inst, const uint8_t* apdu, size_t len) {
+bool t1_transmit_apdu(t1_inst_t* inst, const uint8_t* apdu, size_t len) {
   bool err_serial_out = false;
   bool success = false;
 
