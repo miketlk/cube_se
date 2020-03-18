@@ -13,11 +13,21 @@
 #include "fifo_buf.h"
 
 #ifdef __cplusplus
-    /// Declares function as extern "C"
-    #define T1_EXTERN                   extern "C"
+  /// Declares function as extern "C"
+  #define T1_EXTERN                     extern "C"
 #else
-    /// Declares function as extern
-    #define T1_EXTERN                   extern
+  /// Declares function as extern
+  #define T1_EXTERN                     extern
+#endif
+
+//#define T1_NO_STRUCT_PACKING // TODO: remove
+
+#ifdef T1_NO_STRUCT_PACKING
+  /// Packed attribute for structures
+  #define T1_PACKED
+#else
+  /// Packed attribute for structures
+  #define T1_PACKED                     __attribute__((packed))
 #endif
 
 #ifndef T1_TX_FIFO_SIZE
@@ -33,9 +43,7 @@
 /// Size of receive buffer
 #define T1_RX_BUF_SIZE                  (3+254+2)
 /// Maximal number of protocols specified in ATR
-#define T1_ATR_MAX_IFACES               7
-/// Reserved protocol identifier for global parameters in ATR
-#define T1_ATR_GLOBALS                  15
+#define T1_ATR_MAX_IFACES               16
 
 /// Protocol events
 typedef enum {
@@ -66,6 +74,13 @@ typedef enum {
   t1_config_size              ///< Size of configuration, not an identifier
 } t1_config_prm_id_t;
 
+/// Transmission protocol or qualification of interface bytes
+typedef enum {
+  t1_atr_prot_t0 = 0,  ///< T=0 protocol
+  t1_atr_prot_t1 = 1,  ///< T=1 protocol
+  t1_atr_globals = 15, ///< Global interface bytes
+} t1_protocol_id_t;
+
 /**
  * Callback function that outputs bytes to serial port
  * @param buf         buffer containing data to transmit
@@ -93,12 +108,8 @@ typedef void (*t1_cb_handle_apdu_t)(const uint8_t* apdu, size_t len,
 typedef void (*t1_cb_handle_event_t)(t1_event_t ev_code, const void* ev_prm,
                                      void* p_user_prm);
 
-typedef struct {
-  uint8_t value;
-  uint8_t present;
-} t1_ibyte_t;
-
-typedef struct {
+/// ATR interface structure
+typedef struct T1_PACKED {
   int16_t ta;
   int16_t tb;
   int16_t tc;
@@ -106,11 +117,17 @@ typedef struct {
 } t1_iface_t;
 
 /// Parameter of t1_ev_atr_received event, containing parsed ATR message
-typedef struct {
+typedef struct T1_PACKED {
+  /// Raw ATR
   const uint8_t* atr;
+  /// Length of raw ATR in bytes
   size_t atr_len;
+  /// Interface structures. Several sequential structures may belong to the
+  /// same protocol when more than one set of TA, TB, TC bytes are transferred.
   t1_iface_t ifaces[T1_ATR_MAX_IFACES];
+  /// Number of interface structures decoded
   size_t iface_num;
+  ///
   const uint8_t* hist_bytes;
   size_t hist_nbytes;
 } t1_ev_prm_atr_t;
@@ -217,7 +234,7 @@ T1_EXTERN void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms);
  *
  * This function is used to determine how long the protocol implementation can
  * sleep, assuming that t1_timer_task() is not called by host during sleep. If
- * there is no activity, a maximal value, ULONG_MAX is returned.
+ * there is no activity, a maximal value, UINT32_MAX is returned.
  *
  * IMPORTANT: returned result is valid only until any other function of this
  * protocol is called!

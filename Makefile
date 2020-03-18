@@ -194,11 +194,19 @@ $(BUILD_DIR)/%.bin: $(BUILD_DIR)/%.elf | $(BUILD_DIR)
 $(BUILD_DIR):
 	mkdir $@
 
+.PHONY: clean test
+
 #######################################
 # clean up
 #######################################
 clean:
 	-rm -fR $(BUILD_DIR)
+
+#######################################
+# run tests
+#######################################
+test:
+	@$(MAKE) DEBUG=1 -f Makefile.test test
 
 #######################################
 # dependencies

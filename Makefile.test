@@ -1,0 +1,45 @@
+TARGET_EXEC ?= test_runner
+BUILD_DIR ?= ./build/test
+
+SRC_DIRS ?= ./test
+SRCS := $(shell find $(SRC_DIRS) -name *.cpp -or -name *.c)
+
+INC_DIRS := test Src
+
+OBJS := $(SRCS:%=$(BUILD_DIR)/%.o)
+DEPS := $(OBJS:.o=.d)
+INC_FLAGS := $(addprefix -I,$(INC_DIRS))
+# -Wno-error=
+CPPFLAGS ?= -Werror $(INC_FLAGS) -MMD -MP
+CXXFLAGS ?= -std=c++11
+CFLAGS ?= -std=c99
+LDFLAGS ?= -lstdc++
+
+ifeq ($(DEBUG), 1)
+CPPFLAGS += -g -O0
+endif
+
+$(BUILD_DIR)/$(TARGET_EXEC): $(OBJS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+
+# c source
+$(BUILD_DIR)/%.c.o: %.c
+	$(MKDIR_P) $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# c++ source
+$(BUILD_DIR)/%.cpp.o: %.cpp
+	$(MKDIR_P) $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+.PHONY: clean test
+
+test: $(BUILD_DIR)/$(TARGET_EXEC)
+	@$(BUILD_DIR)/test_runner
+
+clean:
+	$(RM) -r $(BUILD_DIR)
+
+-include $(DEPS)
+
+MKDIR_P ?= mkdir -p
