@@ -1,6 +1,6 @@
 /**
  * @file   t1_protocol.h
- * @brief  ISO/IEC 7816 T=1 Protocol Implementation
+ * @brief  ISO/IEC 7816 T=1 Protocol Implementation, external API
  * @author Mike Tolkachev <mstolkachev@gmail.com>
  */
 
@@ -12,24 +12,10 @@
 #include <stdbool.h>
 #include "fifo_buf.h"
 
-#ifdef __cplusplus
-  /// Declares function as extern "C"
-  #define T1_EXTERN                     extern "C"
-#else
-  /// Declares function as extern
-  #define T1_EXTERN                     extern
-#endif
+// Include common types definition in Part 1
+#include "t1_protocol_defs.h" // Part 1
 
-//#define T1_NO_STRUCT_PACKING // TODO: remove
-
-#ifdef T1_NO_STRUCT_PACKING
-  /// Packed attribute for structures
-  #define T1_PACKED
-#else
-  /// Packed attribute for structures
-  #define T1_PACKED                     __attribute__((packed))
-#endif
-
+// Compile-time settings
 #ifndef T1_TX_FIFO_SIZE
   /// Transmit FIFO size
   #define T1_TX_FIFO_SIZE               1024
@@ -38,32 +24,24 @@
   /// Maximal size of APDU supported by protocol implementation
   #define T1_MAX_APDU_SIZE              255
 #endif
-/// Maximal timeout in milliseconds
-#define T1_MAX_TIMEOUT_MS               10000L
-/// Size of receive buffer
-#define T1_RX_BUF_SIZE                  (3+254+2)
-/// Maximal number of protocols specified in ATR
-#define T1_ATR_MAX_IFACES               16
+#ifndef T1_MAX_TIMEOUT_MS
+  /// Maximal timeout in milliseconds
+  #define T1_MAX_TIMEOUT_MS             10000L
+#endif
 
 /// Protocol events
 typedef enum {
   t1_ev_none = 0,           ///< Not an event
-  t1_ev_reset,              ///< Reset is just performed
-  t1_ev_atr_received,       ///< ATR is received; ev_prm type: t1_ev_prm_atr_t*
-  t1_ev_err_internal = 100, ///< Internal error, following events are errors too
-  t1_ev_err_atr_timeout,    ///< ATR timeout
-  t1_ev_err_comm_failure,   ///< Smart card connection failed
-  t1_ev_err_bad_atr,        ///< Incorrect ATR format
-  t1_ev_err_serial_out,     ///< Error while performing serial output
-} t1_event_t;
-
-/// Sate of protocol FSM
-typedef enum {
-  t1_st_wait_atr = 0,  ///< Waiting for ATR
-  t1_st_idle,          ///< Idle state, ready to transmit
-  t1_st_wait_response, ///< Waiting for response
-  t1_st_error          ///< Error
-} t1_fsm_state_t;
+  t1_ev_reset,              ///< Reset is just performed; parameter: NULL
+  t1_ev_atr_received,       ///< ATR is received; parameter: t1_atr_decoded_t*
+  t1_ev_apdu_received,      ///< APDU is received; parameter: t1_apdu_t*
+  t1_ev_err_internal = 100, ///< Internal error; parameter: NULL
+  t1_ev_err_serial_out,     ///< Serial output error; parameter: NULL
+  t1_ev_err_comm_failure,   ///< Smart card connection failed; parameter: NULL
+  t1_ev_err_atr_timeout,    ///< ATR timeout; parameter: NULL
+  t1_ev_err_bad_atr,        ///< Incorrect ATR format; parameter: NULL
+  t1_ev_err_incompatible,   ///< Incompatible card; parameter: t1_atr_decoded_t*
+} t1_ev_code_t;
 
 /// Identifiers of configuration parameters
 typedef enum {
@@ -71,18 +49,16 @@ typedef enum {
   t1_cfg_tm_atr_ms,           ///< ATR timeout
   t1_cfg_tm_response_ms,      ///< Response timeout
   t1_cfg_use_crc,             ///< Error detection code: 0 - LRC, 1 - CRC
+  t1_cfg_ifsc,                ///< IFSC, card's maximum information block size
+  t1_cfg_rx_skip_bytes,       ///< Number of dummy bytes to skip while receiving
   t1_config_size              ///< Size of configuration, not an identifier
 } t1_config_prm_id_t;
 
-/// Transmission protocol or qualification of interface bytes
-typedef enum {
-  t1_atr_prot_t0 = 0,  ///< T=0 protocol
-  t1_atr_prot_t1 = 1,  ///< T=1 protocol
-  t1_atr_globals = 15, ///< Global interface bytes
-} t1_protocol_id_t;
-
 /**
  * Callback function that outputs bytes to serial port
+ *
+ * IMPORTANT: Calling API functions of the protocol implementation from this
+ * callback function may cause side effects and must be avoided!
  * @param buf         buffer containing data to transmit
  * @param len         length of data block in bytes
  * @param p_user_prm  user defined parameter
@@ -91,82 +67,62 @@ typedef bool (*t1_cb_serial_out_t)(const uint8_t* buf, size_t len,
                                    void* p_user_prm);
 
 /**
- * Callback function that handles received APDUs
- * @param apdu        buffer containing APDU
- * @param len         length of data block in bytes
- * @param p_user_prm  user defined parameter
- */
-typedef void (*t1_cb_handle_apdu_t)(const uint8_t* apdu, size_t len,
-                                    void* p_user_prm);
-
-/**
  * Callback function that handles protocol events
+ *
+ * This protocol implementation guarantees that event handler is always called
+ * just before termination of any external API function. It allows to call
+ * safely any other API function(s) within user handler code.
  * @param ev_code     event code
  * @param ev_prm      event parameter depending on event code, typically NULL
  * @param p_user_prm  user defined parameter
  */
-typedef void (*t1_cb_handle_event_t)(t1_event_t ev_code, const void* ev_prm,
+typedef void (*t1_cb_handle_event_t)(t1_ev_code_t ev_code, const void* ev_prm,
                                      void* p_user_prm);
 
-/// ATR interface structure
-typedef struct T1_PACKED {
-  int16_t ta;
-  int16_t tb;
-  int16_t tc;
-  uint8_t prot_id;
-} t1_iface_t;
+/// Coding convention
+typedef enum {
+  t1_cnv_direct = 0, ///< Direct
+  t1_cnv_inverse     ///< Inverse
+} t1_convention_t;
 
-/// Parameter of t1_ev_atr_received event, containing parsed ATR message
-typedef struct T1_PACKED {
-  /// Raw ATR
+// Indexes within global_bytes[] and t1_bytes[] arrays of t1_atr_decoded_t
+typedef enum {
+  t1_atr_ta1 = 0,   ///< global_bytes[]: TA1;         t1_bytes[]: 1-st TA
+  t1_atr_tb1,       ///< global_bytes[]: TB1;         t1_bytes[]: 1-st TB
+  t1_atr_tc1,       ///< global_bytes[]: TC1;         t1_bytes[]: 1-st TC
+  t1_atr_ta2,       ///< global_bytes[]: TA2;         t1_bytes[]: 2-nd TA
+  t1_atr_tb2,       ///< global_bytes[]: TB2;         t1_bytes[]: 2-nd TB
+  t1_atr_tc2,       ///< global_bytes[]: TC2 of T=0;  t1_bytes[]: 2-nd TC
+  t1_atr_ta3,       ///< global_bytes[]: TA (T=15);   t1_bytes[]: 3-rd TA
+  t1_atr_tb3,       ///< global_bytes[]: TB (T=15);   t1_bytes[]: 3-rd TB
+  t1_atr_tc3,       ///< global_bytes[]: TC (T=15);   t1_bytes[]: 3-rd TC
+  t1_atr_intf_bytes ///< Supported number of interface bytes, not an index
+} t1_intf_byte_idx_t;
+
+/// Decoded ATR message
+typedef struct {
+  /// Raw ATR message
   const uint8_t* atr;
   /// Length of raw ATR in bytes
   size_t atr_len;
-  /// Interface structures. Several sequential structures may belong to the
-  /// same protocol when more than one set of TA, TB, TC bytes are transferred.
-  t1_iface_t ifaces[T1_ATR_MAX_IFACES];
-  /// Number of interface structures decoded
-  size_t iface_num;
-  ///
+  /// Coding convention
+  t1_convention_t convention;
+  /// Global bytes
+  int16_t global_bytes[t1_atr_intf_bytes];
+  /// Interface bytes
+  int16_t t1_bytes[t1_atr_intf_bytes];
+  /// Flag indicating that T=0 protocol is suppoted
+  bool t0_supported;
+  /// Flag indicating that T=1 protocol is suppoted
+  bool t1_supported;
+  /// Historical bytes
   const uint8_t* hist_bytes;
+  /// Number of historical bytes
   size_t hist_nbytes;
-} t1_ev_prm_atr_t;
+} t1_atr_decoded_t;
 
-/// Protocol instance
-typedef struct {
-  /// Callback function that outputs bytes to serial port
-  t1_cb_serial_out_t cb_serial_out;
-  /// Callback function that handles received APDUs
-  t1_cb_handle_apdu_t cb_handle_apdu;
-  /// Callback function that handles protocol events
-  t1_cb_handle_event_t cb_handle_event;
-  /// User defined parameter passed to all calback functions
-  void* p_user_prm;
-  /// FSM state
-  t1_fsm_state_t fsm_state;
-  /// Memory buffer for TX FIFO
-  uint8_t tx_fifo_buf[T1_TX_FIFO_SIZE];
-  /// FIFO buffer
-  fifo_buf_inst_t tx_fifo;
-  /// Number of stored data blocks in TX FIFO
-  size_t tx_fifo_nblock;
-  /// Sequence number, N(S)
-  uint8_t seq_number;
-  /// Protocol configuration
-  int32_t config[t1_config_size];
-  /// Receive buffer
-  uint8_t rx_buf[T1_RX_BUF_SIZE];
-  /// Receive buffer index
-  size_t rx_buf_idx;
-  /// Expected bytes in ATR or current T=1 block
-  size_t expected_bytes;
-  /// Timer for interbyte timeout
-  uint32_t tmr_interbyte_timeout;
-  /// Timer for ATR timeout
-  uint32_t tmr_atr_timeout;
-  /// Timer for response timeout
-  uint32_t tmr_response_timeout;
-} t1_inst_t;
+// Include instance structure definition in Part 2
+#include "t1_protocol_defs.h"
 
 /**
  * Initializes protocol instance
@@ -181,14 +137,12 @@ typedef struct {
  * to restart timeout timer.
  * @param inst             pre-allocated instance, contents are "don't-care"
  * @param cb_serial_out    callback function outputting bytes to serial port
- * @param cb_handle_apdu   callback function handling received APDUs
  * @param cb_handle_event  callback function handling protocol events
  * @param use_crc          if true CRC is used instead LRC for EDC
  * @param p_user_prm       user defined parameter passed to all calbacks
  * @return                 true - OK, false - failure
  */
 T1_EXTERN bool t1_init(t1_inst_t* inst, t1_cb_serial_out_t cb_serial_out,
-                       t1_cb_handle_apdu_t cb_handle_apdu,
                        t1_cb_handle_event_t cb_handle_event, void* p_user_prm);
 
 /**
