@@ -30,17 +30,20 @@
 #endif
 
 /// Protocol events
+///
+/// If parameter is not specified it equals to NULL.
 typedef enum {
   t1_ev_none = 0,           ///< Not an event
-  t1_ev_reset,              ///< Reset is just performed; parameter: NULL
   t1_ev_atr_received,       ///< ATR is received; parameter: t1_atr_decoded_t*
   t1_ev_apdu_received,      ///< APDU is received; parameter: t1_apdu_t*
-  t1_ev_err_internal = 100, ///< Internal error; parameter: NULL
-  t1_ev_err_serial_out,     ///< Serial output error; parameter: NULL
-  t1_ev_err_comm_failure,   ///< Smart card connection failed; parameter: NULL
-  t1_ev_err_atr_timeout,    ///< ATR timeout; parameter: NULL
-  t1_ev_err_bad_atr,        ///< Incorrect ATR format; parameter: NULL
+  t1_ev_err_internal = 100, ///< Internal error
+  t1_ev_err_serial_out,     ///< Serial output error
+  t1_ev_err_comm_failure,   ///< Smart card connection failed
+  t1_ev_err_atr_timeout,    ///< ATR timeout
+  t1_ev_err_bad_atr,        ///< Incorrect ATR format
   t1_ev_err_incompatible,   ///< Incompatible card; parameter: t1_atr_decoded_t*
+  t1_ev_err_oversized_apdu, ///< Received APDU does not fit in buffer
+  t1_ev_err_sc_abort        ///< Operation aborted by smart card
 } t1_ev_code_t;
 
 /// Identifiers of configuration parameters
@@ -121,6 +124,12 @@ typedef struct {
   size_t hist_nbytes;
 } t1_atr_decoded_t;
 
+/// Parameter of t1_ev_apdu_received event
+typedef struct {
+  const uint8_t *apdu; ///< Pointer to buffer containing APDU
+  size_t len;          ///< Length of APDU in bytes
+} t1_apdu_t;
+
 // Include instance structure definition in Part 2
 #include "t1_protocol_defs.h"
 
@@ -161,7 +170,7 @@ T1_EXTERN bool t1_set_config(t1_inst_t* inst, t1_config_prm_id_t prm_id,
  * Returns value of configuration parameter
  * @param inst    protocol instance
  * @param prm_id  parameter identifier
- * @return        value of configuration parameter or 0 if failed
+ * @return        value of configuration parameter or -1 if failed
  */
 T1_EXTERN int32_t t1_get_config(t1_inst_t* inst, t1_config_prm_id_t prm_id);
 

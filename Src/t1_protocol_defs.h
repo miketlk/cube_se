@@ -50,38 +50,38 @@ typedef enum {
 
 /// R-block acknowledgement codes
 typedef enum {
-  rblock_ack_ok = 0x00,       ///< Error free
-  rblock_ack_err_edc = 0x01,  ///< EDC and/or parity error
-  rblock_ack_err_other = 0x02 ///< Other errors
+  t1_rblock_ack_ok = 0x00,       ///< Error free
+  t1_rblock_ack_err_edc = 0x01,  ///< EDC and/or parity error
+  t1_rblock_ack_err_other = 0x02 ///< Other errors
 } t1_rblock_ack_t;
 
 /// S-block command codes
 typedef enum {
-  sblock_cmd_resynch = 0x00, ///< Resynchronization request or response
-  sblock_cmd_ifs = 0x01,     ///< Information field request or response
-  sblock_cmd_abort = 0x02,   ///< Abortion request or response
-  sblock_cmd_wtx = 0x03      ///< Waiting time extension request or response
+  t1_sblock_cmd_resynch = 0x00, ///< Resynchronization request or response
+  t1_sblock_cmd_ifs = 0x01,     ///< Information field request or response
+  t1_sblock_cmd_abort = 0x02,   ///< Abortion request or response
+  t1_sblock_cmd_wtx = 0x03      ///< Waiting time extension request or response
 } t1_sblock_cmd_t;
 
-/// I-block prmeters
+/// I-block parmeters
 typedef struct {
   bool more_data;     ///< more-data bit, "M"
   uint8_t seq_number; ///< Sequence number, "N(S)"
 } t1_iblock_prm_t;
 
-/// R-block prmeters
+/// R-block parmeters
 typedef struct {
   t1_rblock_ack_t ack_code; ///< Acknowledgement code
   uint8_t seq_number;       ///< Sequence number, "N(R)"
 } t1_rblock_prm_t;
 
-/// S-block prmeters
+/// S-block parmeters
 typedef struct {
   t1_sblock_cmd_t command; ///< Command
-  bool response;           ///< Response bit
+  bool is_response;           ///< Response bit
 } t1_sblock_prm_t;
 
-/// Block prmeters
+/// Block parmeters
 typedef struct {
   t1_block_type_t block_type;   ///< Block type
   size_t inf_len;               ///< Length of inf field
@@ -129,8 +129,8 @@ typedef struct {
   int32_t rx_expected_bytes;
   /// Buffer storing received APDU
   uint8_t rx_apdu[T1_MAX_APDU_SIZE];
-  /// Index within rx_apdu[] buffer
-  size_t rx_apdu_idx;
+  /// Parameter of t1_ev_apdu_received event
+  t1_apdu_t rx_apdu_prm;
   /// Receive sequence number, "N(R)"
   uint8_t rx_seq_number;
   /// Timer for interbyte timeout
