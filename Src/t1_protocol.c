@@ -1,7 +1,8 @@
 /**
- * @file   t1_protocol.c
- * @brief  ISO/IEC 7816 T=1 Protocol Implementation
- * @author Mike Tolkachev <mstolkachev@gmail.com>
+ * @file       t1_protocol.c
+ * @brief      ISO/IEC 7816 T=1 Protocol Implementation
+ * @author     Mike Tolkachev <contact@miketolkachev.dev>
+ * @copyright  Copyright 2020 Crypto Advance GmbH. All rights reserved.
  */
 
 #define FIFO_BUF_IMPLEMENT
@@ -10,7 +11,7 @@
 /// Default sleep time in milliseconds
 #define DEF_SLEEP_TIME_MS               50
 /// Maximal timeout in milliseconds, renamed
-#define MAX_TM                          T1_MAX_TIMEOUT_MS
+#define TM_MAX                          T1_MAX_TIMEOUT_MS
 
 /// NAD byte with default values
 #define TX_NAD_VALUE                    0x00
@@ -96,9 +97,10 @@ typedef struct {
 
 /// Header of the block stored in FIFO buffer
 typedef struct {
-  unsigned int size : 9;      ///< Block size in bytes
-  unsigned int type : 2;      ///< Block type, one of t1_block_type_t enums
-  unsigned int more_data : 1; ///< More data flag, "M"
+  unsigned int size : 9;       ///< Block size in bytes
+  unsigned int type : 2;       ///< Block type, one of t1_block_type_t enums
+  unsigned int more_data : 1;  ///< More data flag, "M"
+  unsigned int seq_number : 1; ///< Sequence number "N(S)" or "N(R)"
 } block_hdr_t;
 
 /// One entry in a list of constant (read-only) buffers
@@ -154,12 +156,13 @@ static const uint16_t crc_tbl[256] = {
 
 /// Extended configuration data
 static const ext_config_entry_t ext_config[t1_config_size] = {
-  [t1_cfg_tm_interbyte_ms] = { .min = 1,       .max = MAX_TM,  .def = 50   },
-  [t1_cfg_tm_atr_ms]       = { .min = 1,       .max = MAX_TM,  .def = 1000 },
-  [t1_cfg_tm_response_ms]  = { .min = 1,       .max = MAX_TM,  .def = 500  },
-  [t1_cfg_use_crc]         = { .min = 0,       .max = 1,       .def = 0    },
-  [t1_cfg_ifsc]            = { .min = IFS_MIN, .max = IFS_MAX, .def = 32   },
-  [t1_cfg_rx_skip_bytes]   = { .min = 0,       .max = 255,     .def = 0    }
+  [t1_cfg_tm_interbyte]    = { .min = 1,       .max = TM_MAX,  .def = 50     },
+  [t1_cfg_tm_atr]          = { .min = 1,       .max = TM_MAX,  .def = 1000   },
+  [t1_cfg_tm_response]     = { .min = 1,       .max = TM_MAX,  .def = 200    },
+  [t1_cfg_tm_response_max] = { .min = 1,       .max = TM_MAX,  .def = TM_MAX },
+  [t1_cfg_use_crc]         = { .min = 0,       .max = 1,       .def = 0      },
+  [t1_cfg_ifsc]            = { .min = IFS_MIN, .max = IFS_MAX, .def = 32     },
+  [t1_cfg_rx_skip_bytes]   = { .min = 0,       .max = 255,     .def = 0      }
 };
 
 /**
@@ -312,7 +315,7 @@ static inline size_t edc_size(const t1_inst_t* inst) {
 }
 
 /**
- * Re-initializes receive part of protocol instance
+ * Re-initializes receive part of protocol instance before next reception
  * @param inst              protocol instance
  */
 static void reset_rx(t1_inst_t* inst) {
@@ -321,7 +324,7 @@ static void reset_rx(t1_inst_t* inst) {
   inst->rx_block_prm.inf_len = 0;
   inst->rx_state = t1_rxs_skip;
   inst->rx_expected_bytes = -1;
-  inst->rx_apdu_prm.len = 0;
+  inst->tmr_interbyte_timeout = 0;
 }
 
 void t1_reset(t1_inst_t* inst, bool wait_atr) {
@@ -330,34 +333,45 @@ void t1_reset(t1_inst_t* inst, bool wait_atr) {
     fifo_clear(&inst->tx_fifo);
     inst->tx_fifo_nblock = 0;
     inst->tx_seq_number = 0;
+    inst->tx_last_seq_number = 0;
     inst->tx_attempts = 0;
+    inst->tx_prev_block_prm.block_type = t1_block_unkn;
+    inst->tx_prev_block_prm.inf_len = 0;
+    inst->tx_block_ctr = 0;
     reset_rx(inst);
+    inst->rx_apdu_prm.len = 0;
     inst->rx_seq_number = 0;
-    inst->tmr_interbyte_timeout = 0;
-    inst->tmr_atr_timeout = wait_atr ? inst->config[t1_cfg_tm_atr_ms] : 0;
+    inst->rx_bad_block = false;
+    inst->tmr_atr_timeout = wait_atr ? inst->config[t1_cfg_tm_atr] : 0;
     inst->tmr_response_timeout = 0;
   }
 }
 
 /**
  * Codes T=1 protocol block and pushes it into transmit FIFO buffer
- * @param inst       protocol instance
- * @param type       block type
- * @param pcb        PCB byte
- * @param inf        information field
- * @param inf_len    length of information field in bytes
- * @param more_data  flag indicating that more data will follow in next blocks
- * @return           true if successfull
+ * @param inst        protocol instance
+ * @param type        block type
+ * @param pcb         PCB byte
+ * @param inf         information field
+ * @param inf_len     length of information field in bytes
+ * @param more_data   flag indicating that more data will follow in next blocks
+ * @param seq_number  sequence number "N(S)" or "N(R)", 0 or 1
+ * @return            true if successfull
  */
 static bool push_block(t1_inst_t* inst, t1_block_type_t type, uint8_t pcb,
-                       const uint8_t* inf, size_t inf_len, bool more_data)
+                       const uint8_t* inf, size_t inf_len, bool more_data,
+                       uint8_t seq_number)
 {
   if(inf_len <= inst->config[t1_cfg_ifsc]) {
     size_t block_size = 0;
     uint8_t prologue[prologue_size];
     uint8_t epilogue[MAX_EDC_LEN];
     size_t epilogue_size = 0;
-    block_hdr_t hdr = { .type = type, .more_data = more_data ? 1U : 0U };
+    block_hdr_t hdr = {
+      .type = type,
+      .more_data = more_data ? 1U : 0U,
+      .seq_number = seq_number
+    };
 
     // Create prologue & epilogue
     prologue[prologue_nad] = TX_NAD_VALUE;
@@ -402,7 +416,8 @@ static bool push_iblock(t1_inst_t* inst, const uint8_t* inf, size_t inf_len,
   uint8_t pcb = (inst->tx_seq_number ? IB_NS_BIT : 0) |
                 (more_data ? IB_M_BIT : 0);
 
-  if(push_block(inst, t1_block_i, pcb, inf, inf_len, more_data)) {
+  if(push_block(inst, t1_block_i, pcb, inf, inf_len, more_data,
+                inst->tx_seq_number)) {
     inst->tx_seq_number ^= 1;
     return true;
   }
@@ -479,11 +494,21 @@ static event_t send_sblock(t1_inst_t* inst, t1_sblock_cmd_t command,
   uint8_t* p_edc = buf + prologue_size + buf[prologue_len];
   size_t edc_len = calc_edc(inst, buf, p_edc - buf, p_edc, MAX_EDC_LEN);
 
-  reset_rx(inst);
-  inst->tmr_interbyte_timeout = 0;
-  inst->tmr_response_timeout = inst->config[t1_cfg_tm_response_ms];
-  bool ok = inst->cb_serial_out(buf, p_edc - buf + edc_len, inst->p_user_prm);
-  return ok ? event_none : event(t1_ev_err_serial_out);
+  // Transmit block, advance counter, set timeout
+  if(!inst->cb_serial_out(buf, p_edc - buf + edc_len, inst->p_user_prm)) {
+    return event(t1_ev_err_serial_out);
+  }
+  if(inst->tx_block_ctr < UINT8_MAX) { ++inst->tx_block_ctr; }
+  inst->tmr_response_timeout = inst->config[t1_cfg_tm_response];
+
+  // Save parameters of transmitted block
+  inst->tx_prev_block_prm.block_type = t1_block_s;
+  inst->tx_prev_block_prm.inf_len = buf[prologue_len];
+  inst->tx_prev_block_prm.sblock_prm.command = command;
+  inst->tx_prev_block_prm.sblock_prm.is_response = is_response;
+  inst->tx_prev_block_prm.sblock_prm.inf_byte = inf_byte;
+
+  return event_none;
 }
 
 /**
@@ -502,11 +527,19 @@ static event_t send_rblock(t1_inst_t* inst, t1_rblock_ack_t ack_code,
   buf[prologue_len] = 0;
   calc_edc(inst, buf, prologue_size, buf + prologue_size, MAX_EDC_LEN);
 
-  reset_rx(inst);
-  inst->tmr_interbyte_timeout = 0;
-  inst->tmr_response_timeout = inst->config[t1_cfg_tm_response_ms];
-  bool ok = inst->cb_serial_out(buf, sizeof(buf), inst->p_user_prm);
-  return ok ? event_none : event(t1_ev_err_serial_out);
+  // Transmit block
+  if(!inst->cb_serial_out(buf, sizeof(buf), inst->p_user_prm)) {
+    return event(t1_ev_err_serial_out);
+  }
+  inst->tmr_response_timeout = inst->config[t1_cfg_tm_response];
+
+  // Save parameters of transmitted block
+  inst->tx_prev_block_prm.block_type = t1_block_r;
+  inst->tx_prev_block_prm.inf_len = 0;
+  inst->tx_prev_block_prm.rblock_prm.ack_code = ack_code;
+  inst->tx_prev_block_prm.rblock_prm.seq_number = seq_number;
+
+  return event_none;
 }
 
 /**
@@ -521,9 +554,9 @@ static inline bool tx_fifo_has_block(t1_inst_t* inst) {
 /**
  * Outputs last block from FIFO buffer to serial port
  * @param inst  protocol instance
- * @return      true - OK, false - serial callback reported failure
+ * @return      event or empty event with event_t::code = t1_ev_none
  */
-static bool tx_fifo_send_last_block(t1_inst_t* inst) {
+static event_t tx_fifo_send_last_block(t1_inst_t* inst) {
   if(tx_fifo_has_block(inst)) {
     uint8_t buf[32];
     block_hdr_t hdr;
@@ -532,21 +565,27 @@ static bool tx_fifo_send_last_block(t1_inst_t* inst) {
     fifo_read_buf(&inst->tx_fifo, &read_idx, (uint8_t*)&hdr, sizeof(hdr),
                   sizeof(hdr));
 
-    reset_rx(inst);
-    inst->tmr_interbyte_timeout = 0;
-    inst->tmr_response_timeout = inst->config[t1_cfg_tm_response_ms];
-
+    // Transmit block, advance counter, set timeout
     size_t block_size = hdr.size;
     while(block_size) {
       size_t out_len = min_size_t(block_size, sizeof(buf));
       fifo_read_buf(&inst->tx_fifo, &read_idx, buf, sizeof(buf), out_len);
       if(!inst->cb_serial_out(buf, out_len, inst->p_user_prm)) {
-        return false;
+        return event(t1_ev_err_serial_out);
       }
       block_size -= out_len;
     }
+    if(inst->tx_block_ctr < UINT8_MAX) { ++inst->tx_block_ctr; }
+    inst->tmr_response_timeout = inst->config[t1_cfg_tm_response];
+
+    // Save parameters of transmitted block
+    inst->tx_prev_block_prm.block_type = t1_block_i;
+    inst->tx_prev_block_prm.inf_len = hdr.size - prologue_size - edc_size(inst);
+    inst->tx_prev_block_prm.iblock_prm.more_data = hdr.more_data;
+    inst->tx_prev_block_prm.iblock_prm.seq_number = hdr.seq_number;
+    inst->tx_last_seq_number = hdr.seq_number;
   }
-  return true;
+  return event_none;
 }
 
 /**
@@ -562,23 +601,6 @@ static void tx_fifo_remove_last_block(t1_inst_t* inst) {
     fifo_remove(&inst->tx_fifo, sizeof(hdr) + hdr.size);
     --inst->tx_fifo_nblock;
   }
-}
-
-/**
- * Returns header of the last block from transmit FIFO buffer
- * @param inst  protocol instance
- * @return      header of the last block: block_hdr_t::type = t1_block_unkn in
- *              case of failure
- */
-static block_hdr_t get_last_fifo_block_header(t1_inst_t* inst) {
-  block_hdr_t hdr = { .type = t1_block_unkn };
-
-  if(fifo_nused(&inst->tx_fifo) > sizeof(block_hdr_t)) {
-    size_t read_idx = fifo_get_read_idx(&inst->tx_fifo);
-    fifo_read_buf(&inst->tx_fifo, &read_idx, (uint8_t*)&hdr, sizeof(hdr),
-                  sizeof(hdr));
-  }
-  return hdr;
 }
 
 bool t1_init(t1_inst_t* inst, t1_cb_serial_out_t cb_serial_out,
@@ -777,21 +799,23 @@ static bool handle_atr(t1_inst_t* inst, t1_atr_decoded_t* p_atr) {
 }
 
 /**
- * Handles incorrectly received, incorrectly formatted or lost block
+ * Handles corrupted, incorrect or lost block
  * @param inst        protocol instance
- * @param block_type  block type
+ * @param block_type  type of received block or t1_block_unkn if unknown
  * @param ack_code    suggested acknowledgement code for R-block
  * @return            event or empty event with event_t::code = t1_ev_none
  */
 static event_t handle_bad_block(t1_inst_t* inst, t1_block_type_t block_type,
                                 t1_rblock_ack_t ack_code) {
-  inst->tmr_interbyte_timeout = 0;
   inst->tmr_response_timeout = 0;
+  inst->rx_bad_block = true; // Flag received block as bad
 
   if(inst->fsm_state != t1_st_resync) {
     if(inst->tx_attempts + 1 < DELIVERY_ATTEMPTS) {
       ++inst->tx_attempts;
       return send_rblock(inst, ack_code, inst->rx_seq_number);
+    } else if(inst->tx_block_ctr <= 1) { // Failed delivering very first block
+      return event(t1_ev_err_comm_failure);
     } else { // Do resynchronization
       inst->tx_attempts = 0;
       inst->fsm_state = t1_st_resync;
@@ -805,7 +829,8 @@ static event_t handle_bad_block(t1_inst_t* inst, t1_block_type_t block_type,
       return event(t1_ev_err_comm_failure);
     }
   }
-  return event_none;
+  // Should always transmit something
+  return event(t1_ev_err_internal);
 }
 
 /**
@@ -866,6 +891,15 @@ void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms) {
         if(parse_atr(inst->rx_buf, inst->rx_buf_idx, &atr_decoded)) {
           if(handle_atr(inst, &atr_decoded)) {
             ev = event_ext(t1_ev_atr_received, &atr_decoded);
+            if(tx_fifo_has_block(inst)) {
+              inst->fsm_state = t1_st_wait_response;
+              event_t tmp_ev = tx_fifo_send_last_block(inst);
+              if(is_error(tmp_ev)) {
+                ev = tmp_ev;
+              }
+            } else {
+              inst->fsm_state = t1_st_idle;
+            }
           } else {
             ev = event(t1_ev_err_incompatible);
           }
@@ -917,7 +951,6 @@ static event_t handle_atr_data(t1_inst_t* inst, const uint8_t* buf,
     inst->rx_buf[inst->rx_buf_idx++] = *p_byte++;
   }
   inst->tmr_atr_timeout = 0;
-  inst->tmr_interbyte_timeout = inst->config[t1_cfg_tm_interbyte_ms];
   // ATR will be parsed by timer, when smart card stops transmitting bytes
 
   return event_none;
@@ -952,10 +985,8 @@ static bool save_apdu_data(t1_inst_t* inst, const uint8_t* inf,
 static event_t send_next_block(t1_inst_t* inst) {
   tx_fifo_remove_last_block(inst);
   if(tx_fifo_has_block(inst)) {
-    if(!tx_fifo_send_last_block(inst)) {
-      return event(t1_ev_err_serial_out);
-    }
     inst->fsm_state = t1_st_wait_response;
+    return tx_fifo_send_last_block(inst);
   } else {
     inst->fsm_state = t1_st_idle;
   }
@@ -989,9 +1020,36 @@ static event_t handle_iblock(t1_inst_t* inst, uint8_t seq_number,
       } else {
         return event(t1_ev_err_oversized_apdu);
       }
-    } else {
-      return handle_bad_block(inst, t1_block_i, t1_rblock_ack_err_other);
     }
+  }
+  return handle_bad_block(inst, t1_block_i, t1_rblock_ack_err_other);
+}
+
+/**
+ * Re-sends previous block directly via serial out callback function
+ * @param inst  protocol instance
+ * @return      event or empty event with event_t::code = t1_ev_none
+ */
+static event_t resend_prev_block(t1_inst_t* inst) {
+  const t1_block_prm_t *p_prev = &inst->tx_prev_block_prm;
+
+  switch(p_prev->block_type) {
+    case t1_block_i:
+      if(tx_fifo_has_block(inst)) {
+        return tx_fifo_send_last_block(inst);
+      }
+      break;
+
+    case t1_block_r:
+      return send_rblock(inst, p_prev->rblock_prm.ack_code,
+                         p_prev->rblock_prm.seq_number);
+
+    case t1_block_s:
+      return send_sblock(inst, p_prev->sblock_prm.command,
+                         p_prev->sblock_prm.is_response,
+                         p_prev->sblock_prm.inf_byte);
+    default:
+      break;
   }
   return event_none;
 }
@@ -1005,8 +1063,48 @@ static event_t handle_iblock(t1_inst_t* inst, uint8_t seq_number,
  */
 static event_t handle_rblock(t1_inst_t* inst, uint8_t seq_number,
                              t1_rblock_ack_t ack_code) {
-  // TODO: implement
-  return event_none;
+  const t1_block_prm_t *p_prev = &inst->tx_prev_block_prm;
+
+  if(inst->fsm_state == t1_st_wait_response) {
+    switch(ack_code) {
+      case t1_rblock_ack_ok:
+        if(p_prev->block_type == t1_block_i && p_prev->iblock_prm.more_data &&
+           seq_number != inst->tx_last_seq_number) {
+          return send_next_block(inst);
+        }
+        break;
+
+      case t1_rblock_ack_err_edc:
+      case t1_rblock_ack_err_other:
+        // Flag block corruption because it was reported by card, so attempts
+        // counter will not be re-initialized.
+        inst->rx_bad_block = true;
+        if(inst->tx_attempts + 1 < DELIVERY_ATTEMPTS) { // Resend block
+          ++inst->tx_attempts;
+          return resend_prev_block(inst);
+        } else { // Resynchronization
+          inst->tx_attempts = 0;
+          inst->fsm_state = t1_st_resync;
+          return send_sblock(inst, t1_sblock_cmd_resynch, false, -1);
+        }
+        break;
+    }
+  }
+  return handle_bad_block(inst, t1_block_r, t1_rblock_ack_err_other);
+}
+
+/**
+ * Increases response timeout for current transaction
+ * @param inst  protocol instance
+ * @param mult  multiplier
+ */
+static inline void increase_response_timeout(t1_inst_t* inst, uint8_t mult) {
+  if(mult) {
+    inst->tmr_response_timeout *= mult;
+    if(inst->tmr_response_timeout > inst->config[t1_cfg_tm_response_max]) {
+      inst->tmr_response_timeout = inst->config[t1_cfg_tm_response_max];
+    }
+  }
 }
 
 /**
@@ -1014,24 +1112,17 @@ static event_t handle_rblock(t1_inst_t* inst, uint8_t seq_number,
  * @param inst         protocol instance
  * @param command      R-block parmeters
  * @param is_response  flag indicating that this is a response
- * @param inf          information field
- * @param inf_len      length of information field in bytes
+ * @param inf_byte     INF byte, -1 if absent
  * @return             event or empty event with event_t::code = t1_ev_none
  */
 static event_t handle_sblock(t1_inst_t* inst, t1_sblock_cmd_t command,
-                            bool is_response, const uint8_t* inf,
-                            size_t inf_len) {
-
+                            bool is_response, int16_t inf_byte) {
   if(inst->fsm_state != t1_st_resync) {
     switch(command) {
       case t1_sblock_cmd_ifs:
-        if(!is_response) {
-          if(inf_len && inf[0] <= IFS_MIN && inf[0] >= IFS_MAX) {
-            inst->config[t1_cfg_ifsc] = inf[0];
-            return send_sblock(inst, t1_sblock_cmd_ifs, true, -1);
-          } else {
-            return handle_bad_block(inst, t1_block_s, t1_rblock_ack_err_other);
-          }
+        if(!is_response && inf_byte >= IFS_MIN && inf_byte <= IFS_MAX) {
+          inst->config[t1_cfg_ifsc] = inf_byte;
+          return send_sblock(inst, t1_sblock_cmd_ifs, true, -1);
         }
         break;
 
@@ -1039,32 +1130,33 @@ static event_t handle_sblock(t1_inst_t* inst, t1_sblock_cmd_t command,
         return event(t1_ev_err_sc_abort);
 
       case t1_sblock_cmd_wtx:
-        // TODO: handle
+        if(!is_response && inf_byte > 0) {
+          event_t ev = send_sblock(inst, t1_sblock_cmd_wtx, true, -1);
+          increase_response_timeout(inst, inf_byte);
+          return ev;
+        }
         break;
 
       default:
-        return handle_bad_block(inst, t1_block_s, t1_rblock_ack_err_other);
+        break;
     }
-    // TODO: impl
   } else { // Resynchronization
     if(command == t1_sblock_cmd_resynch && is_response) {
-      // Reset protocol state and retry last block if available
-      inst->rx_seq_number = 0;
+      // Reset protocol state and retry last I-block if available
       inst->tx_seq_number = 0;
+      inst->tx_last_seq_number = 0;
+      inst->rx_seq_number = 0;
       inst->config[t1_cfg_ifsc] = ext_config[t1_cfg_ifsc].def;
       if(tx_fifo_has_block(inst)) {
-        if(!tx_fifo_send_last_block(inst)) {
-          return event(t1_ev_err_serial_out);
-        }
         inst->fsm_state = t1_st_wait_response;
+        return tx_fifo_send_last_block(inst);
       } else {
         inst->fsm_state = t1_st_idle;
+        inst->tx_prev_block_prm.block_type = t1_block_unkn;
       }
-    } else {
-      return handle_bad_block(inst, t1_block_s, t1_rblock_ack_err_other);
     }
   }
-  return event_none;
+  return handle_bad_block(inst, t1_block_s, t1_rblock_ack_err_other);
 }
 
 /**
@@ -1076,8 +1168,6 @@ static event_t handle_sblock(t1_inst_t* inst, t1_sblock_cmd_t command,
  */
 static event_t handle_block(t1_inst_t* inst, t1_block_prm_t* p_prm,
                             const uint8_t* inf) {
-  inst->tmr_interbyte_timeout = 0;
-
   switch(p_prm->block_type) {
     case t1_block_i:
       return handle_iblock(inst, p_prm->iblock_prm.seq_number,
@@ -1092,7 +1182,8 @@ static event_t handle_block(t1_inst_t* inst, t1_block_prm_t* p_prm,
 
     case t1_block_s:
       return handle_sblock(inst, p_prm->sblock_prm.command,
-                           p_prm->sblock_prm.is_response, inf, p_prm->inf_len);
+                           p_prm->sblock_prm.is_response,
+                           p_prm->sblock_prm.inf_byte);
 
     default:
       return handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
@@ -1119,6 +1210,7 @@ static inline void decode_pcb(t1_block_prm_t* p_prm, uint8_t pcb) {
       p_prm->block_type = t1_block_s;
       p_prm->sblock_prm.is_response = (pcb & SB_RESP_BIT) ? true : false;
       p_prm->sblock_prm.command = (t1_sblock_cmd_t)(pcb & SB_CMD_MASK);
+      p_prm->sblock_prm.inf_byte = -1;
       break;
 
     default: // I-block
@@ -1162,6 +1254,8 @@ static bool check_rx_block_edc(t1_inst_t* inst) {
  */
 static event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf,
                                  size_t len) {
+  event_t ev = event_none;
+
   if(inst->rx_buf_idx) {
     const uint8_t* p_byte = buf;
 
@@ -1170,7 +1264,9 @@ static event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf,
       if(inst->rx_buf_idx < T1_RX_BUF_SIZE) {
         inst->rx_buf[inst->rx_buf_idx++] = *p_byte;
       } else {
-        return handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+        ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+        reset_rx(inst);
+        return ev;
       }
 
       // Handle received byte
@@ -1204,7 +1300,8 @@ static event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf,
             inst->rx_expected_bytes = *p_byte;
             inst->rx_state = t1_rxs_inf;
           } else { // Unsupported format
-            return handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+            ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+            reset_rx(inst);
           }
           break;
 
@@ -1217,17 +1314,29 @@ static event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf,
         case t1_rxs_edc:
           if(--inst->rx_expected_bytes == 0) {
             if(check_rx_block_edc(inst)) {
-              return handle_block(inst, &inst->rx_block_prm,
-                                  inst->rx_buf + prologue_size);
+              // Fill single INF byte for S-block
+              if(inst->rx_block_prm.block_type == t1_block_s &&
+                 inst->rx_block_prm.inf_len) {
+                inst->rx_block_prm.sblock_prm.inf_byte =
+                  inst->rx_buf[prologue_size];
+              }
+              inst->rx_bad_block = false;
+              ev = handle_block(inst, &inst->rx_block_prm,
+                                inst->rx_buf + prologue_size);
+              if(!inst->rx_bad_block && inst->fsm_state != t1_st_resync) {
+                // Reset attempts counter if block is not flagged as bad
+                inst->tx_attempts = 0;
+              }
             } else {
-              return handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_edc);
+              ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_edc);
             }
+            reset_rx(inst);
           }
           break;
       }
     }
   }
-  return event_none;
+  return ev;
 }
 
 void t1_serial_in(t1_inst_t* inst, const uint8_t* buf, size_t len) {
@@ -1237,20 +1346,17 @@ void t1_serial_in(t1_inst_t* inst, const uint8_t* buf, size_t len) {
     // Handle received data
     switch(inst->fsm_state) {
       case t1_st_wait_atr:
-        inst->tmr_interbyte_timeout = inst->config[t1_cfg_tm_interbyte_ms];
+        inst->tmr_interbyte_timeout = inst->config[t1_cfg_tm_interbyte];
         ev = handle_atr_data(inst, buf, len);
         break;
 
       case t1_st_wait_response:
-        inst->tmr_interbyte_timeout = inst->config[t1_cfg_tm_interbyte_ms];
+      case t1_st_resync:
+        inst->tmr_interbyte_timeout = inst->config[t1_cfg_tm_interbyte];
         ev = handle_t1_data(inst, buf, len);
         break;
 
       default:
-        reset_rx(inst);
-        inst->tmr_interbyte_timeout = 0;
-        inst->tmr_atr_timeout = 0;
-        inst->tmr_response_timeout = 0;
         break;
     }
     handle_event(inst, ev);  // Call event handler straight before returning
@@ -1261,12 +1367,10 @@ bool t1_transmit_apdu(t1_inst_t* inst, const uint8_t* apdu, size_t len) {
   if(inst && apdu && len && inst->fsm_state != t1_st_error) {
     if(push_iblock_chain(inst, apdu, len)) {
       if(inst->fsm_state == t1_st_idle) {
-        if(!tx_fifo_send_last_block(inst)) {
-          // Call event handler straight before returning
-          handle_event(inst, event(t1_ev_err_serial_out));
-          return false;
-        }
+        event_t ev = tx_fifo_send_last_block(inst);
         inst->fsm_state = t1_st_wait_response;
+        handle_event(inst, ev); // Call event handler straight before returning
+        return is_error(ev);
       }
       return true;
     }

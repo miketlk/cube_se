@@ -1,7 +1,8 @@
 /**
- * @file   t1_protocol.h
- * @brief  ISO/IEC 7816 T=1 Protocol Implementation, external API
- * @author Mike Tolkachev <mstolkachev@gmail.com>
+ * @file       t1_protocol.h
+ * @brief      ISO/IEC 7816 T=1 Protocol Implementation, external API
+ * @author     Mike Tolkachev <contact@miketolkachev.dev>
+ * @copyright  Copyright 2020 Crypto Advance GmbH. All rights reserved.
  */
 
 #ifndef T1_PROTOCOL_H
@@ -26,7 +27,7 @@
 #endif
 #ifndef T1_MAX_TIMEOUT_MS
   /// Maximal timeout in milliseconds
-  #define T1_MAX_TIMEOUT_MS             10000L
+  #define T1_MAX_TIMEOUT_MS             4000L
 #endif
 
 /// Protocol events
@@ -36,7 +37,7 @@ typedef enum {
   t1_ev_none = 0,           ///< Not an event
   t1_ev_atr_received,       ///< ATR is received; parameter: t1_atr_decoded_t*
   t1_ev_apdu_received,      ///< APDU is received; parameter: t1_apdu_t*
-  t1_ev_err_internal = 100, ///< Internal error
+  t1_ev_err_internal = 100, ///< Internal error, also beginning of error codes
   t1_ev_err_serial_out,     ///< Serial output error
   t1_ev_err_comm_failure,   ///< Smart card connection failed
   t1_ev_err_atr_timeout,    ///< ATR timeout
@@ -48,13 +49,14 @@ typedef enum {
 
 /// Identifiers of configuration parameters
 typedef enum {
-  t1_cfg_tm_interbyte_ms = 0, ///< Inter-byte timeout
-  t1_cfg_tm_atr_ms,           ///< ATR timeout
-  t1_cfg_tm_response_ms,      ///< Response timeout
-  t1_cfg_use_crc,             ///< Error detection code: 0 - LRC, 1 - CRC
-  t1_cfg_ifsc,                ///< IFSC, card's maximum information block size
-  t1_cfg_rx_skip_bytes,       ///< Number of dummy bytes to skip while receiving
-  t1_config_size              ///< Size of configuration, not an identifier
+  t1_cfg_tm_interbyte = 0, ///< Inter-byte timeout in ms
+  t1_cfg_tm_atr,           ///< ATR timeout in ms
+  t1_cfg_tm_response,      ///< Response timeout in ms
+  t1_cfg_tm_response_max,  ///< Maximal response timeout in ms after WTX request
+  t1_cfg_use_crc,          ///< Error detection code: 0 - LRC, 1 - CRC
+  t1_cfg_ifsc,             ///< IFSC, card's maximum information block size
+  t1_cfg_rx_skip_bytes,    ///< Number of dummy bytes to skip while receiving
+  t1_config_size           ///< Size of configuration, not an identifier
 } t1_config_prm_id_t;
 
 /**
@@ -170,7 +172,7 @@ T1_EXTERN bool t1_set_config(t1_inst_t* inst, t1_config_prm_id_t prm_id,
  * Returns value of configuration parameter
  * @param inst    protocol instance
  * @param prm_id  parameter identifier
- * @return        value of configuration parameter or -1 if failed
+ * @return        value of parameter; -1 if failed or parameter not initialized
  */
 T1_EXTERN int32_t t1_get_config(t1_inst_t* inst, t1_config_prm_id_t prm_id);
 

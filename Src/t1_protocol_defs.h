@@ -1,7 +1,8 @@
 /**
- * @file   t1_protocol_defs.h
- * @brief  ISO/IEC 7816 T=1 Protocol Implementation, internal definitions
- * @author Mike Tolkachev <mstolkachev@gmail.com>
+ * @file       t1_protocol_defs.h
+ * @brief      ISO/IEC 7816 T=1 Protocol Implementation, internal definitions
+ * @author     Mike Tolkachev <contact@miketolkachev.dev>
+ * @copyright  Copyright 2020 Crypto Advance GmbH. All rights reserved.
  *
  * IMPORTANT: For internal use only, include "t1_protocol.h" instead!
  */
@@ -78,7 +79,8 @@ typedef struct {
 /// S-block parmeters
 typedef struct {
   t1_sblock_cmd_t command; ///< Command
-  bool is_response;           ///< Response bit
+  bool is_response;        ///< Response bit
+  int16_t inf_byte;        ///< INF byte, -1 if absent
 } t1_sblock_prm_t;
 
 /// Block parmeters
@@ -111,10 +113,18 @@ typedef struct {
   fifo_buf_inst_t tx_fifo;
   /// Number of stored data blocks in TX FIFO
   size_t tx_fifo_nblock;
-  /// Transmit sequence number, "N(S)"
+  /// Current transmit sequence number, "N(S)" updated when block is placed into
+  /// FIFO buffer
   uint8_t tx_seq_number;
+  /// Last value of transmit sequence number, "N(S)" saved when a block is
+  /// transmitted via serial out callback function
+  uint8_t tx_last_seq_number;
   /// Number of attempts left to deliver block
   uint8_t tx_attempts;
+  /// Parameters of the previously transmitted block
+  t1_block_prm_t tx_prev_block_prm;
+  /// Counter of transmitted I- and S- blocks, saturated to UINT8_MAX
+  uint8_t tx_block_ctr;
   /// Protocol configuration
   int32_t config[t1_config_size];
   /// Receive buffer storing ATR or T=1 block
@@ -131,6 +141,8 @@ typedef struct {
   uint8_t rx_apdu[T1_MAX_APDU_SIZE];
   /// Parameter of t1_ev_apdu_received event
   t1_apdu_t rx_apdu_prm;
+  /// Flag indicating that received block is corrupted or incorrect
+  bool rx_bad_block;
   /// Receive sequence number, "N(R)"
   uint8_t rx_seq_number;
   /// Timer for interbyte timeout
