@@ -156,9 +156,9 @@ static const uint16_t crc_tbl[256] = {
 
 /// Extended configuration data
 static const ext_config_entry_t ext_config[t1_config_size] = {
-  [t1_cfg_tm_interbyte]    = { .min = 1,       .max = TM_MAX,  .def = 50     },
+  [t1_cfg_tm_interbyte]    = { .min = 1,       .max = TM_MAX,  .def = 100    },
   [t1_cfg_tm_atr]          = { .min = 1,       .max = TM_MAX,  .def = 1000   },
-  [t1_cfg_tm_response]     = { .min = 1,       .max = TM_MAX,  .def = 200    },
+  [t1_cfg_tm_response]     = { .min = 1,       .max = TM_MAX,  .def = 1000   },
   [t1_cfg_tm_response_max] = { .min = 1,       .max = TM_MAX,  .def = TM_MAX },
   [t1_cfg_use_crc]         = { .min = 0,       .max = 1,       .def = 0      },
   [t1_cfg_ifsc]            = { .min = IFS_MIN, .max = IFS_MAX, .def = 32     },
@@ -341,6 +341,7 @@ void t1_reset(t1_inst_t* inst, bool wait_atr) {
     reset_rx(inst);
     inst->rx_apdu_prm.len = 0;
     inst->rx_seq_number = 0;
+    inst->rx_new_apdu = true;
     inst->rx_bad_block = false;
     inst->tmr_atr_timeout = wait_atr ? inst->config[t1_cfg_tm_atr] : 0;
     inst->tmr_response_timeout = 0;
@@ -431,7 +432,7 @@ static bool push_iblock(t1_inst_t* inst, const uint8_t* inf, size_t inf_len,
  * @param ifsc      IFSC, card's maximum information block size
  * @return          total size of chained I-blocks in bytes or 0 if failure
  */
-static inline size_t iblock_chain_size(t1_inst_t* inst, size_t apdu_len,
+static inline size_t iblock_chain_size(const t1_inst_t* inst, size_t apdu_len,
                                        size_t ifsc) {
   if(ifsc) {
     size_t iblock_overhead = prologue_size + edc_size(inst);
@@ -547,7 +548,7 @@ static event_t send_rblock(t1_inst_t* inst, t1_rblock_ack_t ack_code,
  * @param inst  protocol instance
  * @return      true if at least one block is available
  */
-static inline bool tx_fifo_has_block(t1_inst_t* inst) {
+static inline bool tx_fifo_has_block(const t1_inst_t* inst) {
   return fifo_nused(&inst->tx_fifo) > sizeof(block_hdr_t);
 }
 
@@ -632,7 +633,7 @@ bool t1_set_config(t1_inst_t* inst, t1_config_prm_id_t prm_id, int32_t value) {
   return false;
 }
 
-int32_t t1_get_config(t1_inst_t* inst, t1_config_prm_id_t prm_id) {
+int32_t t1_get_config(const t1_inst_t* inst, t1_config_prm_id_t prm_id) {
   if(inst && prm_id >= 0 &&  prm_id < t1_config_size) {
     return inst->config[prm_id];
   }
@@ -881,7 +882,7 @@ static bool timer_elapsed(uint32_t *p_timer, uint32_t elapsed_ms) {
 }
 
 void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms) {
-  if(inst && inst->fsm_state != t1_st_error) {
+  if(inst && inst->fsm_state != t1_st_error && elapsed_ms) {
     event_t ev = event_none;
     t1_atr_decoded_t atr_decoded;
 
@@ -909,19 +910,21 @@ void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms) {
       } else if (inst->fsm_state == t1_st_wait_response) {
         ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
       }
+      reset_rx(inst);
     }
     if(timer_elapsed(&inst->tmr_atr_timeout, elapsed_ms)) {
       ev = event(t1_ev_err_atr_timeout);
     }
     if(timer_elapsed(&inst->tmr_response_timeout, elapsed_ms)) {
       ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+      reset_rx(inst);
     }
 
     handle_event(inst, ev); // Call event handler straight before returning
   }
 }
 
-uint32_t t1_can_sleep_ms(t1_inst_t* inst) {
+uint32_t t1_can_sleep_ms(const t1_inst_t* inst) {
   if(inst) {
     if(inst->tmr_interbyte_timeout ||
        inst->tmr_atr_timeout ||
@@ -965,6 +968,10 @@ static event_t handle_atr_data(t1_inst_t* inst, const uint8_t* buf,
  */
 static bool save_apdu_data(t1_inst_t* inst, const uint8_t* inf,
                            size_t inf_len) {
+  if(inst->rx_new_apdu) {
+    inst->rx_apdu_prm.len = 0;
+  }
+
   if(inst->rx_apdu_prm.len + inf_len <= T1_MAX_APDU_SIZE) {
     const uint8_t *p_inf = inf;
     uint8_t *p_apdu = inst->rx_apdu + inst->rx_apdu_prm.len;
@@ -1013,6 +1020,7 @@ static event_t handle_iblock(t1_inst_t* inst, uint8_t seq_number,
         if(more_data) {
           return send_rblock(inst, t1_rblock_ack_ok, inst->rx_seq_number);
         } else {
+          inst->rx_new_apdu = true;
           event_t ev = send_next_block(inst);
           return is_error(ev) ?
                  ev : event_ext(t1_ev_apdu_received, &inst->rx_apdu_prm);
@@ -1226,7 +1234,7 @@ static inline void decode_pcb(t1_block_prm_t* p_prm, uint8_t pcb) {
  * @param inst  protocol instance
  * @return      true if EDC is correct
  */
-static bool check_rx_block_edc(t1_inst_t* inst) {
+static bool check_rx_block_edc(const t1_inst_t* inst) {
   if(inst->rx_buf_idx >= prologue_size + edc_size(inst)) {
     uint8_t edc_buf[MAX_EDC_LEN];
     size_t checked_size = inst->rx_buf_idx - edc_size(inst);
@@ -1252,88 +1260,84 @@ static bool check_rx_block_edc(t1_inst_t* inst) {
  * @param len        number of bytes received
  * @return           event code in case of event or t1_ev_none
  */
-static event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf,
-                                 size_t len) {
+static event_t handle_t1_data(t1_inst_t* inst, const uint8_t* buf, size_t len) {
   event_t ev = event_none;
+  const uint8_t* p_byte = buf;
 
-  if(inst->rx_buf_idx) {
-    const uint8_t* p_byte = buf;
+  for(size_t i = 0; i < len; i++, p_byte++) {
+    // Store received byte in receive buffer
+    if(inst->rx_buf_idx < T1_RX_BUF_SIZE) {
+      inst->rx_buf[inst->rx_buf_idx++] = *p_byte;
+    } else {
+      ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+      reset_rx(inst);
+      return ev;
+    }
 
-    for(size_t i = 0; i < len; i++, p_byte++) {
-      // Store received byte in receive buffer
-      if(inst->rx_buf_idx < T1_RX_BUF_SIZE) {
-        inst->rx_buf[inst->rx_buf_idx++] = *p_byte;
-      } else {
-        ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
-        reset_rx(inst);
-        return ev;
-      }
+    // Handle received byte
+    switch(inst->rx_state) {
+      case t1_rxs_skip:
+        if(inst->rx_expected_bytes < 0) {
+          inst->rx_expected_bytes = inst->config[t1_cfg_rx_skip_bytes];
+        }
+        if(inst->rx_expected_bytes && inst->rx_buf_idx) {
+          --inst->rx_buf_idx; // Remove current byte from buffer
+          --inst->rx_expected_bytes;
+        } else {
+          inst->rx_state = t1_rxs_pcb; // Skipping NAD byte
+        }
+        break;
 
-      // Handle received byte
-      switch(inst->rx_state) {
-        case t1_rxs_skip:
-          if(inst->rx_expected_bytes < 0) {
-            inst->rx_expected_bytes = inst->config[t1_cfg_rx_skip_bytes];
-          }
-          if(inst->rx_expected_bytes && inst->rx_buf_idx) {
-            --inst->rx_buf_idx; // Remove current byte from buffer
-            --inst->rx_expected_bytes;
-          } else {
-            inst->rx_state = t1_rxs_pcb; // Skipping NAD byte
-          }
-          break;
+      case t1_rxs_nad:
+        inst->rx_state = t1_rxs_pcb; // Just skip NAD byte
+        break;
 
-        case t1_rxs_nad:
-          inst->rx_state = t1_rxs_pcb; // Just skip NAD byte
-          break;
+      case t1_rxs_pcb:
+        decode_pcb(&inst->rx_block_prm, *p_byte);
+        inst->rx_state = t1_rxs_len;
+        break;
 
-        case t1_rxs_pcb:
-          decode_pcb(&inst->rx_block_prm, *p_byte);
-          inst->rx_state = t1_rxs_len;
-          break;
+      case t1_rxs_len:
+        if(*p_byte == 0) { // INF is absent
+          inst->rx_state = t1_rxs_edc;
+          inst->rx_expected_bytes = edc_size(inst);
+        } else if(*p_byte <= T1_MAX_LEN_VALUE) { // INF is present
+          inst->rx_block_prm.inf_len = *p_byte;
+          inst->rx_expected_bytes = *p_byte;
+          inst->rx_state = t1_rxs_inf;
+        } else { // Unsupported format
+          ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
+          reset_rx(inst);
+        }
+        break;
 
-        case t1_rxs_len:
-          if(*p_byte == 0) { // INF is absent
-            inst->rx_state = t1_rxs_edc;
-            inst->rx_expected_bytes = edc_size(inst);
-          } else if(*p_byte <= T1_MAX_LEN_VALUE) { // INF is present
-            inst->rx_expected_bytes = *p_byte;
-            inst->rx_state = t1_rxs_inf;
-          } else { // Unsupported format
-            ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_other);
-            reset_rx(inst);
-          }
-          break;
+      case t1_rxs_inf:
+        if(--inst->rx_expected_bytes == 0) {
+          inst->rx_state = t1_rxs_edc;
+          inst->rx_expected_bytes = edc_size(inst);
+        }
+        break;
 
-        case t1_rxs_inf:
-          if(--inst->rx_expected_bytes == 0) {
-            inst->rx_state = t1_rxs_edc;
-          }
-          break;
-
-        case t1_rxs_edc:
-          if(--inst->rx_expected_bytes == 0) {
-            if(check_rx_block_edc(inst)) {
-              // Fill single INF byte for S-block
-              if(inst->rx_block_prm.block_type == t1_block_s &&
-                 inst->rx_block_prm.inf_len) {
-                inst->rx_block_prm.sblock_prm.inf_byte =
-                  inst->rx_buf[prologue_size];
-              }
-              inst->rx_bad_block = false;
-              ev = handle_block(inst, &inst->rx_block_prm,
-                                inst->rx_buf + prologue_size);
-              if(!inst->rx_bad_block && inst->fsm_state != t1_st_resync) {
-                // Reset attempts counter if block is not flagged as bad
-                inst->tx_attempts = 0;
-              }
-            } else {
-              ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_edc);
+      case t1_rxs_edc:
+        if(--inst->rx_expected_bytes == 0) {
+          if(check_rx_block_edc(inst)) {
+            // Fill single INF byte for S-block
+            t1_block_prm_t* p_prm = &inst->rx_block_prm;
+            if(p_prm->block_type == t1_block_s && p_prm->inf_len) {
+              p_prm->sblock_prm.inf_byte = inst->rx_buf[prologue_size];
             }
-            reset_rx(inst);
+            inst->rx_bad_block = false;
+            ev = handle_block(inst, p_prm, inst->rx_buf + prologue_size);
+            if(!inst->rx_bad_block && inst->fsm_state != t1_st_resync) {
+              // Reset attempts counter if block is not flagged as bad
+              inst->tx_attempts = 0;
+            }
+          } else {
+            ev = handle_bad_block(inst, t1_block_unkn, t1_rblock_ack_err_edc);
           }
-          break;
-      }
+          reset_rx(inst);
+        }
+        break;
     }
   }
   return ev;
@@ -1370,10 +1374,18 @@ bool t1_transmit_apdu(t1_inst_t* inst, const uint8_t* apdu, size_t len) {
         event_t ev = tx_fifo_send_last_block(inst);
         inst->fsm_state = t1_st_wait_response;
         handle_event(inst, ev); // Call event handler straight before returning
-        return is_error(ev);
+        return !is_error(ev);
       }
       return true;
     }
   }
   return false;
+}
+
+bool t1_is_error_event(t1_ev_code_t ev_code) {
+  return ev_code >= t1_ev_err_internal;
+}
+
+bool t1_has_error(const t1_inst_t* inst) {
+  return inst->fsm_state == t1_st_error;
 }

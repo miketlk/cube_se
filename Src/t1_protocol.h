@@ -62,6 +62,8 @@ typedef enum {
 /**
  * Callback function that outputs bytes to serial port
  *
+ * This function may be either blocking or non-blocking, but latter is
+ * recommended for completely asynchronous operation.
  * IMPORTANT: Calling API functions of the protocol implementation from this
  * callback function may cause side effects and must be avoided!
  * @param buf         buffer containing data to transmit
@@ -77,6 +79,8 @@ typedef bool (*t1_cb_serial_out_t)(const uint8_t* buf, size_t len,
  * This protocol implementation guarantees that event handler is always called
  * just before termination of any external API function. It allows to call
  * safely any other API function(s) within user handler code.
+ * Helper function t1_is_error_event() may be used to check if an occurred event
+ * is an error.
  * @param ev_code     event code
  * @param ev_prm      event parameter depending on event code, typically NULL
  * @param p_user_prm  user defined parameter
@@ -174,7 +178,8 @@ T1_EXTERN bool t1_set_config(t1_inst_t* inst, t1_config_prm_id_t prm_id,
  * @param prm_id  parameter identifier
  * @return        value of parameter; -1 if failed or parameter not initialized
  */
-T1_EXTERN int32_t t1_get_config(t1_inst_t* inst, t1_config_prm_id_t prm_id);
+T1_EXTERN int32_t t1_get_config(const t1_inst_t* inst,
+                                t1_config_prm_id_t prm_id);
 
 /**
  * Re-initializes protocol instance cleaning receive and transmit buffers
@@ -187,7 +192,7 @@ T1_EXTERN void t1_reset(t1_inst_t* inst, bool wait_atr);
  * Timer task, called by host periodically to implement timeouts
  *
  * This function must be called periodically by host application at least once
- * in 50ms but not earlier than 1ms since previous call.
+ * in 50ms.
  *
  * @param inst        protocol instance
  * @param elapsed_ms  time in milliseconds passed since previous call
@@ -207,7 +212,7 @@ T1_EXTERN void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms);
  * @param  inst  protocol instance
  * @return       the maximal time in ms the protocol implementation can sleep
  */
-T1_EXTERN uint32_t t1_can_sleep_ms(t1_inst_t* inst);
+T1_EXTERN uint32_t t1_can_sleep_ms(const t1_inst_t* inst);
 
 /**
  * Handles received bytes from serial port
@@ -226,5 +231,24 @@ T1_EXTERN void t1_serial_in(t1_inst_t* inst, const uint8_t* buf, size_t len);
  */
 T1_EXTERN bool t1_transmit_apdu(t1_inst_t* inst, const uint8_t* apdu,
                                 size_t len);
+
+/**
+ * Helper function checking if protocol event signifies an error
+ * @param ev_code  event code
+ * @return         true if given event code signifies an error
+ */
+T1_EXTERN bool t1_is_error_event(t1_ev_code_t ev_code);
+
+/**
+ * Helper function checking if protocol implementation is in error state
+ *
+ * T=1 protocol implementation is always locked in error state in case any
+ * critical error is encountered that is signaled by error event. To continue
+ * normal operation, protocol implementation needs to be reset by calling
+ * t1_reset() function.
+ * @param inst  protocol instance
+ * @return      true if protocol implementation is locked in error state
+ */
+T1_EXTERN bool t1_has_error(const t1_inst_t* inst);
 
 #endif // T1_PROTOCOL_H

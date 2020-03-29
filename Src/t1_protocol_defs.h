@@ -141,6 +141,8 @@ typedef struct {
   uint8_t rx_apdu[T1_MAX_APDU_SIZE];
   /// Parameter of t1_ev_apdu_received event
   t1_apdu_t rx_apdu_prm;
+  /// Flag indicating that a new APDU is going to be received
+  bool rx_new_apdu;
   /// Flag indicating that received block is corrupted or incorrect
   bool rx_bad_block;
   /// Receive sequence number, "N(R)"
