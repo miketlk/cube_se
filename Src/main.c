@@ -54,6 +54,7 @@ typedef struct {
   uint32_t sc_tx_timeout;         ///< HAL transmit timeout for smart card
   int card_present;               ///< Nonzero if card is present
   bool card_powered;              ///< True when power is applied to smartcard
+  int reset_attempts;             ///< Counter of card reset attempts
 } user_t1_ctx_t;
 /* USER CODE END PTD */
 
@@ -181,6 +182,7 @@ static void smartcard_read(){
   print_log(msg);
 }
 static void smartcard_poweron(){
+  HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(SC_POWER_PORT, SC_POWER_PIN, GPIO_PIN_RESET);
   HAL_Delay(200);
   HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_SET);
@@ -463,7 +465,7 @@ static bool cb_serial_out(const uint8_t* buf, size_t len, void* p_user_prm) {
     if(ctx->byte_logging) {
       print_log(ASCII_RED);
       print_buf(buf, len, true);
-      print_log(ASCII_RESET);
+      print_log(ASCII_RESET "\r\n");
     }
 
     HAL_StatusTypeDef tx_status =
@@ -544,10 +546,17 @@ static void cb_handle_event(t1_ev_code_t ev_code, const void* ev_prm,
     user_t1_ctx_t* ctx = (user_t1_ctx_t*)p_user_prm;
     if(ctx) {
       if(ctx->card_present && ctx->card_powered) {
-        print_log("Resetting smartcard\r\n");
-        smartcard_reset();
+        if(ctx->reset_attempts < 3) {
+          ++ctx->reset_attempts;
+          print_log("Resetting smartcard\r\n");
+          smartcard_reset();
+          t1_reset(ctx->inst, true);
+        } else {
+          print_log("Powering off smartcard\r\n");
+          smartcard_poweroff();
+          ctx->card_powered = false;
+        }
       }
-      t1_reset(ctx->inst, true);
     }
   }
 }
@@ -570,7 +579,7 @@ static void smartcard_t1_read_v2(user_t1_ctx_t* ctx) {
     if(ctx->byte_logging) {
       print_log(ASCII_GREEN);
       print_buf(buf, received, true);
-      print_log(ASCII_RESET);
+      print_log(ASCII_RESET "\r\n");
     }
     t1_serial_in(ctx->inst, buf, received);
   }
@@ -708,12 +717,12 @@ int main(void)
     if(!card_present) {  user_ctx.card_powered = false; }
 
     #ifdef USE_NEW_T1
+      uint32_t tick = HAL_GetTick();
       if(user_ctx.card_powered) {
-        uint32_t tick = HAL_GetTick();
         t1_timer_task(&t1_inst, elapsed_ticks(tick, prev_tick));
-        prev_tick = tick;
         smartcard_t1_read_v2(&user_ctx);
       }
+      prev_tick = tick;
     #endif
 
     char c = ' ';
@@ -728,6 +737,7 @@ int main(void)
           t1_seq_number = 0;
           t1_seq_number = t1_seq_number; // To suppress warning
           t1_reset(&t1_inst, true);
+          user_ctx.reset_attempts = 0;
           print_help();
         }else{
           print_err("Smartcard is not present\r\n");

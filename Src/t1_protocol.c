@@ -902,7 +902,7 @@ void t1_timer_task(t1_inst_t* inst, uint32_t elapsed_ms) {
               inst->fsm_state = t1_st_idle;
             }
           } else {
-            ev = event(t1_ev_err_incompatible);
+            ev = event_ext(t1_ev_err_incompatible, &atr_decoded);
           }
         } else {
           ev = event(t1_ev_err_bad_atr);
@@ -1140,7 +1140,8 @@ static event_t handle_sblock(t1_inst_t* inst, t1_sblock_cmd_t command,
       case t1_sblock_cmd_wtx:
         if(!is_response && inf_byte > 0) {
           event_t ev = send_sblock(inst, t1_sblock_cmd_wtx, true, -1);
-          increase_response_timeout(inst, inf_byte);
+          // Increase response time at least twice if the card is asking for it
+          increase_response_timeout(inst, inf_byte < 2 ? 2 : inf_byte);
           return ev;
         }
         break;
