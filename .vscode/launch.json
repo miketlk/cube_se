@@ -13,6 +13,13 @@
             "servertype": "openocd",
             "svdFile": "./debug/STM32F469.svd",
             "configFiles": [ "board/stm32f469discovery.cfg" ]
+        },
+        {
+            "name": "Debug Tests (lldb)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/test/test_runner",
+            "args": ["-b"], // Break on a test failure
         }
     ]
 }

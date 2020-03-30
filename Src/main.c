@@ -25,11 +25,37 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "t1_protocol.h"
 /* USER CODE END Includes */
+
+#define USE_NEW_T1
+
+// ASCII color codes
+#define ASCII_BLACK                     "\e[0;30m"
+#define ASCII_RED                       "\e[0;31m"
+#define ASCII_GREEN                     "\e[0;32m"
+#define ASCII_YELLOW                    "\e[0;33m"
+#define ASCII_BLUE                      "\e[0;34m"
+#define ASCII_MAGENTA                   "\e[0;35m"
+#define ASCII_CYAN                      "\e[0;36m"
+#define ASCII_WHITE                     "\e[0;37m"
+#define ASCII_RESET                     "\e[0m"
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+/// User context passed to all callback functions of T=1 protocol
+typedef struct {
+  t1_inst_t* inst;                ///< T=1 protocol instance
+  bool byte_logging;              ///< If true enables byte loging
+  SMARTCARD_HandleTypeDef* p_sc;  ///< Pointer to smart card handle
+  uint32_t sc_tx_timeout;         ///< HAL transmit timeout for smart card
+  int card_present;               ///< Nonzero if card is present
+  bool card_powered;              ///< True when power is applied to smartcard
+  int reset_attempts;             ///< Counter of card reset attempts
+} user_t1_ctx_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -74,6 +100,9 @@ UART_HandleTypeDef huart6;
 
 SDRAM_HandleTypeDef hsdram1;
 
+// T=1 protocol instance
+static t1_inst_t t1_inst;
+
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -103,10 +132,33 @@ static void MX_USART6_UART_Init(void);
 static void print_log(const char * msg){
   HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 1000);
 }
+
 static void print_err(const char * msg){
   HAL_UART_Transmit(&huart3, (uint8_t *)"[err]: ", 7, 1000);
   HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 1000);
 }
+
+static void print_buf_ext(const char* name, const uint8_t* buf, size_t len,
+                      bool byte_spaces, bool cr_lf) {
+  if(name && strlen(name)) {
+    print_log(name);
+  }
+
+  char msg[8];
+  for(size_t i = 0; i < len; i++) {
+    snprintf(msg, sizeof(msg), byte_spaces ? " %02x" : "%02x", buf[i]);
+    print_log(msg);
+  }
+
+  if(cr_lf) {
+    print_log("\r\n");
+  }
+}
+
+static void print_buf(const uint8_t* buf, size_t len, bool byte_spaces) {
+  print_buf_ext(NULL, buf, len, byte_spaces, false);
+}
+
 static int smartcard_check(){
   GPIO_PinState card_present = HAL_GPIO_ReadPin(SC_DETECT_PORT, SC_DETECT_PIN);
   HAL_GPIO_WritePin(LED4_GPIO_Port, LED4_Pin, !card_present);
@@ -130,16 +182,21 @@ static void smartcard_read(){
   print_log(msg);
 }
 static void smartcard_poweron(){
+  HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(SC_POWER_PORT, SC_POWER_PIN, GPIO_PIN_RESET);
   HAL_Delay(200);
   HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_SET);
-  smartcard_read();
+  #ifndef USE_NEW_T1
+    smartcard_read();
+  #endif
 }
 static void smartcard_reset(){
   HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_RESET);
   HAL_Delay(200);
   HAL_GPIO_WritePin(SC_RESET_PORT, SC_RESET_PIN, GPIO_PIN_SET);
-  smartcard_read();
+  #ifndef USE_NEW_T1
+    smartcard_read();
+  #endif
 }
 static void smartcard_poweroff(){
   HAL_Delay(200);
@@ -148,8 +205,8 @@ static void smartcard_poweroff(){
 // keycard-specific commands
 static void keycard_select(){
   // uint8_t cmd_select[] = {
-  //                     0x00, 0xA4, 0x04, 0x00, 0x09, 
-  //                     0xA0, 0x00, 0x00, 0x08, 0x04, 
+  //                     0x00, 0xA4, 0x04, 0x00, 0x09,
+  //                     0xA0, 0x00, 0x00, 0x08, 0x04,
   //                     0x00, 0x01, 0x01, 0x01 //, 0x00
   //                   };
   uint8_t cmd_select[] = { 0x00, 0x84, 0x00, 0x00, 0x00 };
@@ -172,7 +229,7 @@ static void keycard_select(){
 
   /* Start the receive IT process: to receive the command answer from the card */
   // HAL_SMARTCARD_Receive_IT(&hsc2, (uint8_t *)&answer[0], 1);
-  
+
   /* Wait until receiving the answer from the card */
   // while(HAL_SMARTCARD_GetState(&hsc2) != HAL_SMARTCARD_STATE_READY)
   // {}
@@ -237,7 +294,7 @@ static void smartcard_get_teapot_secret2() {
 }
 
 static void smartcard_submit_default_issuer_code() {
-  uint8_t cmd_submit_code[] = { 0x80, 0x20, 0x07, 0x00, 0x08, 0x41, 0x43, 0x4F, 
+  uint8_t cmd_submit_code[] = { 0x80, 0x20, 0x07, 0x00, 0x08, 0x41, 0x43, 0x4F,
                                 0x53, 0x54, 0x45, 0x53, 0x54 };
   uint8_t answer[40] = {0x00};
 
@@ -263,6 +320,7 @@ static void smartcard_start_session() {
   print_log(msg);
 }
 
+#ifndef USE_NEW_T1
 static uint8_t smartcard_t1_transmit_apdu(const uint8_t *apdu, int apdu_length,
   uint8_t *p_seq_number) {
   uint8_t buf[254+4];
@@ -275,7 +333,7 @@ static uint8_t smartcard_t1_transmit_apdu(const uint8_t *apdu, int apdu_length,
   *(p++) = *p_seq_number; // PCB
   *p_seq_number ^= 0x40;
   *(p++) = apdu_length; // LEN
-  
+
   memcpy(buf + 3, apdu, apdu_length);
   p += apdu_length;
 
@@ -287,7 +345,9 @@ static uint8_t smartcard_t1_transmit_apdu(const uint8_t *apdu, int apdu_length,
   HAL_SMARTCARD_Transmit(&hsc2, buf, p - buf, 100);
   return 1;
 }
+#endif // !USE_NEW_T1
 
+#ifndef USE_NEW_T1
 static void smartcard_t1_read(){
   uint8_t buf[100] = { 0 };
   char msg[205] = "";
@@ -335,7 +395,7 @@ static void smartcard_t1_read(){
               sprintf(msg+strlen(msg), "%02x ", buf[i + 3]);
             }
           }
-          break;          
+          break;
       }
     }
   }
@@ -343,7 +403,9 @@ static void smartcard_t1_read(){
   sprintf(msg+strlen(msg), "\r\n");
   print_log(msg);
 }
+#endif // !USE_NEW_T1
 
+#ifndef USE_NEW_T1
 static void smartcard_select_teapot_t1(uint8_t *p_seq_number) {
   uint8_t apdu[] = { 0x00, 0xA4, 0x04, 0x00, 0x06, 0xB0, 0x0B, 0x51, 0x11, 0xCA, 0x01 };
 
@@ -352,7 +414,9 @@ static void smartcard_select_teapot_t1(uint8_t *p_seq_number) {
   smartcard_t1_read();
   HAL_Delay(100);
 }
+#endif // !USE_NEW_T1
 
+#ifndef USE_NEW_T1
 static void smartcard_teapot_store_data_t1(uint8_t *p_seq_number, uint8_t *p_byte_value) {
   uint8_t apdu[] = { 0xB0, 0xA2, 0x00, 0x00, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
   char msg[205] = "";
@@ -370,7 +434,9 @@ static void smartcard_teapot_store_data_t1(uint8_t *p_seq_number, uint8_t *p_byt
   smartcard_t1_read();
   HAL_Delay(100);
 }
+#endif // !USE_NEW_T1
 
+#ifndef USE_NEW_T1
 static void smartcard_teapot_get_data_t1(uint8_t *p_seq_number) {
   uint8_t apdu[] = { 0xB0, 0xA1, 0x00, 0x00, 0 };
 
@@ -378,6 +444,191 @@ static void smartcard_teapot_get_data_t1(uint8_t *p_seq_number) {
 
   smartcard_t1_read();
   HAL_Delay(100);
+}
+#endif // !USE_NEW_T1
+
+static void fatal_error(const char* err_text) {
+  print_log("\r\n\r\n** FATAL ERROR: ");
+  print_log( (err_text && strlen(err_text)) ? err_text : "<unknown>" );
+  while(1); // Place breakpoint here
+}
+
+/**
+ * Callback function of T=1 protocol that outputs bytes to serial port
+ * @param buf         buffer containing data to transmit
+ * @param len         length of data block in bytes
+ * @param p_user_prm  user defined parameter
+ */
+static bool cb_serial_out(const uint8_t* buf, size_t len, void* p_user_prm) {
+  user_t1_ctx_t* ctx = (user_t1_ctx_t*)p_user_prm;
+  if(ctx) {
+    if(ctx->byte_logging) {
+      print_log(ASCII_RED);
+      print_buf(buf, len, true);
+      print_log(ASCII_RESET "\r\n");
+    }
+
+    HAL_StatusTypeDef tx_status =
+      HAL_SMARTCARD_Transmit(ctx->p_sc, (uint8_t*)buf, len, ctx->sc_tx_timeout);
+
+    // Workaround: read dummy 0x00 byte from receiver right after transmission
+    uint8_t dummy[1];
+    HAL_SMARTCARD_Receive(ctx->p_sc, dummy, sizeof(dummy), 0);
+
+    return HAL_OK == tx_status;
+  }
+  return false;
+}
+
+/**
+ * Callback function of T=1 protocol that handles protocol events
+ * @param ev_code     event code
+ * @param ev_prm      event parameter depending on event code, typically NULL
+ * @param p_user_prm  user defined parameter
+ */
+static void cb_handle_event(t1_ev_code_t ev_code, const void* ev_prm,
+                            void* p_user_prm) {
+  switch(ev_code) {
+    case t1_ev_atr_received: {
+        const t1_atr_decoded_t* p_atr = (const t1_atr_decoded_t*)ev_prm;
+        print_buf_ext("ATR received: ", p_atr->atr, p_atr->atr_len, false, true);
+      }
+      break;
+
+    case t1_ev_apdu_received: {
+        const t1_apdu_t* p_apdu = (const t1_apdu_t*)ev_prm;
+        print_buf_ext("APDU received: ", p_apdu->apdu, p_apdu->len, true, true);
+      }
+      break;
+
+    case t1_ev_err_internal:
+      print_err("T=1 internal error\r\n");
+      break;
+
+    case t1_ev_err_serial_out:
+      print_err("Serial output error\r\n");
+      break;
+
+    case t1_ev_err_comm_failure:
+      print_err("Smart card connection failed\r\n");
+      break;
+
+    case t1_ev_err_atr_timeout:
+      print_err("ATR timeout\r\n");
+      break;
+
+    case t1_ev_err_bad_atr:
+       print_err("Incorrect ATR format\r\n");
+      break;
+
+    case t1_ev_err_incompatible: {
+        const t1_atr_decoded_t* p_atr = (const t1_atr_decoded_t*)ev_prm;
+        print_buf_ext("Incompatible card, ATR: ", p_atr->atr, p_atr->atr_len,
+                      false, true);
+      }
+      break;
+
+    case t1_ev_err_oversized_apdu:
+      print_err("Received APDU does not fit in buffer\r\n");
+      break;
+
+    case t1_ev_err_sc_abort:
+      print_err("Operation aborted by smart card\r\n");
+      break;
+
+    // To calm down static analysis tools
+    default:
+      break;
+  }
+
+  if(t1_is_error_event(ev_code)) {
+    // Reset the card and T=1 interface
+    user_t1_ctx_t* ctx = (user_t1_ctx_t*)p_user_prm;
+    if(ctx) {
+      if(ctx->card_present && ctx->card_powered) {
+        if(ctx->reset_attempts < 3) {
+          ++ctx->reset_attempts;
+          print_log("Resetting smartcard\r\n");
+          smartcard_reset();
+          t1_reset(ctx->inst, true);
+        } else {
+          print_log("Powering off smartcard\r\n");
+          smartcard_poweroff();
+          ctx->card_powered = false;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Reads bytes from HAL smart card driver with minimal timeout and passes them
+ * to T=1 protocol implementation
+ * @param ctx  user context for T=1 protocol
+ */
+static void smartcard_t1_read_v2(user_t1_ctx_t* ctx) {
+  HAL_StatusTypeDef status = HAL_ERROR;
+  uint8_t buf[300];
+  size_t received = 0;
+
+  do {
+    status = HAL_SMARTCARD_Receive(ctx->p_sc, buf + received, 1, 10);
+  } while (status == HAL_OK && ++received < sizeof(buf));
+
+  if(received) {
+    if(ctx->byte_logging) {
+      print_log(ASCII_GREEN);
+      print_buf(buf, received, true);
+      print_log(ASCII_RESET "\r\n");
+    }
+    t1_serial_in(ctx->inst, buf, received);
+  }
+}
+
+static void smartcard_select_teapot_t1_v2(user_t1_ctx_t* ctx) {
+  uint8_t apdu[] = {
+    0x00, 0xA4, 0x04, 0x00, 0x06, 0xB0, 0x0B, 0x51, 0x11, 0xCA, 0x01
+  };
+
+  if(!t1_transmit_apdu(ctx->inst, apdu, sizeof(apdu))) {
+    fatal_error("Error while transmitting APDU");
+  }
+}
+
+static void smartcard_teapot_store_data_t1_v2(user_t1_ctx_t* ctx,
+                                              uint8_t *p_byte_value) {
+  uint8_t apdu[] =
+  {
+    0xB0, 0xA2, 0x00, 0x00, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  };
+
+  for(int i = 5; i < sizeof(apdu); i++) {
+    apdu[i] = (*p_byte_value)++;
+  }
+  print_buf_ext("Data: ", &apdu[5], sizeof(apdu) - 5, true, true);
+
+  if(!t1_transmit_apdu(ctx->inst, apdu, sizeof(apdu))) {
+    fatal_error("Error while transmitting APDU");
+  }
+}
+
+static void smartcard_teapot_get_data_t1_v2(user_t1_ctx_t* ctx) {
+  uint8_t apdu[] = { 0xB0, 0xA1, 0x00, 0x00, 0 };
+
+  if(!t1_transmit_apdu(ctx->inst, apdu, sizeof(apdu))) {
+    fatal_error("Error while transmitting APDU");
+  }
+}
+
+/**
+ * Returns elapsed ticks taiking into account possible counter overflow
+ * @param tick       current timestamp
+ * @param prev_tick  previous timestamp
+ * @return           elapsed ticks
+ */
+static inline uint32_t elapsed_ticks(uint32_t tick, uint32_t prev_tick) {
+  return (tick >= prev_tick) ?
+           tick - prev_tick : UINT32_MAX - prev_tick + tick + 1;
 }
 
 /* USER CODE END 0 */
@@ -389,10 +640,11 @@ static void print_help() {
   print_log("  `s` - send hardcoded command { 0x00, 0x84, 0x00, 0x00, 0x00 }\r\n");
   print_log("  `q` - remove power from smart card\r\n");
   print_log("  `i` - submit default issuer code `ACOSTEST`\r\n");
-  print_log("  `e` - send START SESSION command { 0x80, 0x84, 0x00, 0x00, 0x08 }\r\n");  
-  print_log("  `1`, `2`, `3` - toggle LED 1/2/3\r\n"); 
-  print_log("  `7`, `8` - start and end selecting Teapot applet \r\n"); 
-  print_log("  `9`, `0` - start and end getting Teapot secret \r\n"); 
+  print_log("  `e` - send START SESSION command { 0x80, 0x84, 0x00, 0x00, 0x08 }\r\n");
+  print_log("  `1`, `2`, `3` - toggle LED 1/2/3\r\n");
+  print_log("  `7`, `8` - start and end selecting Teapot applet \r\n");
+  print_log("  `9`, `0` - start and end getting Teapot secret \r\n");
+  print_log("  `l` - toggle T=1 logging (on by default) \r\n");
   print_log("  `z` - select Teapot applet using T=1 \r\n");
   print_log("  `x` - store 16 sequential bytes in Teapot applet, T=1\r\n");
   print_log("  `c` - read data from Teapot applet, T=1\r\n");
@@ -406,11 +658,18 @@ int main(void)
 {
     uint8_t t1_seq_number = 0;
     uint8_t byte_value = 0;
+    user_t1_ctx_t user_ctx = {
+      .inst = &t1_inst,
+      .byte_logging = true,
+      .p_sc = &hsc2,
+      .sc_tx_timeout = 100,
+      .card_powered = false
+    };
 
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
-  
+
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -444,26 +703,41 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USART6_UART_Init();
 
-  /* USER CODE BEGIN 2 */
-  /* USER CODE END 2 */
+  if(!t1_init(&t1_inst, cb_serial_out, cb_handle_event, &user_ctx)) {
+    fatal_error("Unable to initialize T=1 protocol implementation");
+  }
+  //TODO: remove t1_set_config(&t1_inst, t1_cfg_rx_skip_bytes, 1);
 
   print_help();
 
-
+  uint32_t prev_tick = HAL_GetTick();
   while (1)
   {
-    /* USER CODE END WHILE */
-    /* USER CODE BEGIN 3 */
-    // HAL_Delay(100);
+    int card_present = user_ctx.card_present = smartcard_check();
+    if(!card_present) {  user_ctx.card_powered = false; }
+
+    #ifdef USE_NEW_T1
+      uint32_t tick = HAL_GetTick();
+      if(user_ctx.card_powered) {
+        t1_timer_task(&t1_inst, elapsed_ticks(tick, prev_tick));
+        smartcard_t1_read_v2(&user_ctx);
+      }
+      prev_tick = tick;
+    #endif
+
     char c = ' ';
-    HAL_UART_Receive(&huart3, (uint8_t *)&c, 1, 0xFFFF);
-    int card_present = smartcard_check();
+    if(HAL_UART_Receive(&huart3, (uint8_t *)&c, 1, 0) != HAL_OK) { continue; }
+
     switch(c){
       case 'p':
         if(card_present){
           print_log("Powering smartcard\r\n");
           smartcard_poweron();
+          user_ctx.card_powered = true;
           t1_seq_number = 0;
+          t1_seq_number = t1_seq_number; // To suppress warning
+          t1_reset(&t1_inst, true);
+          user_ctx.reset_attempts = 0;
           print_help();
         }else{
           print_err("Smartcard is not present\r\n");
@@ -474,6 +748,7 @@ int main(void)
           print_log("Resetting smartcard\r\n");
           smartcard_reset();
           t1_seq_number = 0;
+          t1_reset(&t1_inst, true);
         }else{
           print_err("Smartcard is not present\r\n");
         }
@@ -490,6 +765,7 @@ int main(void)
         if(card_present){
           print_log("Powering off smartcard\r\n");
           smartcard_poweroff();
+          user_ctx.card_powered = false;
         }else{
           print_err("Smartcard is not present\r\n");
         }
@@ -509,7 +785,7 @@ int main(void)
         } else {
           print_err("Smartcard is not present\r\n");
         }
-        break;        
+        break;
       case '7':
         if(card_present){
           print_log("Select Teapot start\r\n");
@@ -542,33 +818,51 @@ int main(void)
           print_err("Smartcard is not present\r\n");
         }
         break;
+      case 'l':
+      case 'L':
+        user_ctx.byte_logging = !user_ctx.byte_logging;
+        print_log("T=1 logging: ");
+        print_log(user_ctx.byte_logging ? "on\r\n" : "off\r\n");
+        break;
       case 'z':
-      case 'Z':      
+      case 'Z':
         if(card_present){
           print_log("Select Teapot T=1\r\n");
-          smartcard_select_teapot_t1(&t1_seq_number);
+          #ifdef USE_NEW_T1
+            smartcard_select_teapot_t1_v2(&user_ctx);
+          #else
+            smartcard_select_teapot_t1(&t1_seq_number);
+          #endif
         } else {
           print_err("Smartcard is not present\r\n");
         }
         break;
       case 'x':
-      case 'X':      
+      case 'X':
         if(card_present){
-          print_log("Store data in Teapot\r\n");
-          smartcard_teapot_store_data_t1(&t1_seq_number, &byte_value);
+          print_log("Store data in Teapot T=1\r\n");
+          #ifdef USE_NEW_T1
+            smartcard_teapot_store_data_t1_v2(&user_ctx, &byte_value);
+          #else
+            smartcard_teapot_store_data_t1(&t1_seq_number, &byte_value);
+          #endif
         } else {
           print_err("Smartcard is not present\r\n");
         }
-        break; 
+        break;
       case 'c':
-      case 'C':      
+      case 'C':
         if(card_present){
-          print_log("Get data from Teapot\r\n");
-          smartcard_teapot_get_data_t1(&t1_seq_number);
+          print_log("Get data from Teapot T=1\r\n");
+          #ifdef USE_NEW_T1
+            smartcard_teapot_get_data_t1_v2(&user_ctx);
+          #else
+            smartcard_teapot_get_data_t1(&t1_seq_number);
+          #endif
         } else {
           print_err("Smartcard is not present\r\n");
         }
-        break;                         
+        break;
       case '1':
         HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
         break;
@@ -596,11 +890,11 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage 
+  /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-  /** Initializes the CPU, AHB and APB busses clocks 
+  /** Initializes the CPU, AHB and APB busses clocks
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
@@ -615,13 +909,13 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  /** Activate the Over-Drive mode 
+  /** Activate the Over-Drive mode
   */
   if (HAL_PWREx_EnableOverDrive() != HAL_OK)
   {
     Error_Handler();
   }
-  /** Initializes the CPU, AHB and APB busses clocks 
+  /** Initializes the CPU, AHB and APB busses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
@@ -1120,7 +1414,7 @@ static void MX_USART2_SMARTCARD_Init(void)
   hsc2.Init.BaudRate = 10081; // 10080;// 10080;  /* Starting baudrate = 3,5MHz / 372etu */
   hsc2.Init.CLKPolarity = SMARTCARD_POLARITY_LOW;
   hsc2.Init.CLKPhase = SMARTCARD_PHASE_1EDGE; // SMARTCARD_PHASE_1EDGE;
-  hsc2.Init.CLKLastBit = SMARTCARD_LASTBIT_ENABLE; // SMARTCARD_LASTBIT_ENABLE;  
+  hsc2.Init.CLKLastBit = SMARTCARD_LASTBIT_ENABLE; // SMARTCARD_LASTBIT_ENABLE;
   hsc2.Init.Prescaler = SMARTCARD_PRESCALER_SYSCLK_DIV12;
   hsc2.Init.GuardTime = 16; //16;
   /* END from example */
@@ -1468,7 +1762,7 @@ void Error_Handler(void)
   * @retval None
   */
 void assert_failed(uint8_t *file, uint32_t line)
-{ 
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
      tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
